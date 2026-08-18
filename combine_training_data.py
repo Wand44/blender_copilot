@@ -1,18 +1,26 @@
-import json 
-
-files = ['training_data/blender_addons.jsonl', 
-         'training_data/general_blender_info.jsonl',
-         'training_data/blender_QA_pairs.jsonl'] 
+import json
+import os
 
 training_data = []
+training_dir = 'training_data'
 
-for file in files:
-    with open(file, 'r') as f:
+files = sorted(
+    os.path.join(training_dir, filename)
+    for filename in os.listdir(training_dir)
+    if os.path.isfile(os.path.join(training_dir, filename)) and filename.endswith('.jsonl')
+)
+
+for file_path in files:
+    with open(file_path, 'r', encoding='utf-8') as f:
+        print(f"Loading {file_path}...")
         for line in f:
-            training_data.append(json.loads(line.strip()))
-            
+            line = line.strip()
+            if not line:
+                continue
+            training_data.append(json.loads(line))
+
 print(f"Loaded total: {len(training_data)}")
-            
-with open('training_data.jsonl', 'w') as f:
+
+with open('training_data.jsonl', 'w', encoding='utf-8') as f:
     for item in training_data:
         f.write(json.dumps(item, ensure_ascii=False) + '\n')
