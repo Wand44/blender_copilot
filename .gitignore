@@ -1,1 +1,5 @@
-fails/Blender52LTSManual.pdf
+.venv
+.env
+.gitignore
+generation.log
+script/__pycache__
