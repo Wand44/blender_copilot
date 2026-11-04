@@ -6,10 +6,21 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from bs4 import BeautifulSoup
+import blender_config
 
-DOC_DIR = os.path.join(os.path.dirname(__file__), "../data/raw/blender_python_reference_5_2")
-OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "../data/processed/doc_data.jsonl")
+DOC_DIR = blender_config.DOC_DIR_DEFAULT
+OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "../data/doc_data.jsonl")
 MAX_PARALLEL_WORKERS = min(16, os.cpu_count() or 4)
+
+
+def resolve_paths():
+    """Allow the doc source and output paths to be overridden from the CLI."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Extract Blender API docs to JSONL")
+    parser.add_argument("--doc-dir", default=DOC_DIR, help="path to the Sphinx HTML docs")
+    parser.add_argument("--output", default=OUTPUT_FILE, help="output JSONL file")
+    args = parser.parse_args()
+    return args.doc_dir, args.output
 
 def clean_signature(text):
     text = ' '.join(text.split())
@@ -72,13 +83,17 @@ def process_file(file_path):
     return file_path, results
 
 def main():
+    doc_dir, output_file = resolve_paths()
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+
     print("=== Blender API Docs Q&A Extraction Pipeline ===")
-    print(f"Source: {DOC_DIR}")
+    print(f"Source: {doc_dir}")
+    print(f"Output: {output_file}")
 
     # Phase 1: orchestrator - scan and filter files
     print("\nPhase 1: Scanning files...")
     html_files = []
-    for root, _dirs, files in os.walk(DOC_DIR):
+    for root, _dirs, files in os.walk(doc_dir):
         for name in files:
             if name.endswith('.html'):
                 html_files.append(os.path.join(root, name))
@@ -127,8 +142,8 @@ def main():
     unique_qas = [group[0] for group in grouped.values()]
     print(f"Deduplication complete: {len(unique_qas)} unique Q&A pairs")
 
-    print(f"\nWriting {len(unique_qas)} Q&A pairs to: {OUTPUT_FILE}")
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+    print(f"\nWriting {len(unique_qas)} Q&A pairs to: {output_file}")
+    with open(output_file, 'w', encoding='utf-8') as f:
         for qa in unique_qas:
             record = {
                 "question": qa["question"],
