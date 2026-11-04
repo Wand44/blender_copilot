@@ -1,20 +1,35 @@
+"""Combine all data sources into the final train/validation dataset.
+
+Reads the RAW sources (validated here, in memory - no intermediate files):
+valid rows are kept, tagged with type/source, ratio-sampled, deduplicated
+across sources, capped at 35% per type, and split 95/5 (seed 42).
+
+Outputs exactly one file: data/final_dataset.jsonl (95/5 split is carried
+as a "split" field on each row: "train" or "validation").
+"""
 import json
 import os
 import random
-import logging
-from typing import Dict, List, Any, Optional
-from tqdm import tqdm
+import re
+import sys
+from collections import Counter
+from typing import Dict, List
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import validator
+
+DATA = "/home/mintlover/Documents/python/blender_copilot/data"
+SEED = 42
+TYPE_CAP = 0.35
+VAL_SPLIT = 0.05
+
 CONFIG = {
     "paths": {
-        "synthetic": "/home/mintlover/Documents/python/blender_copilot/data/synthetic_training_data.jsonl",
-        "raw_addons": "/home/mintlover/Documents/python/blender_copilot/data/addons_data.jsonl",
-        "raw_general": "/home/mintlover/Documents/python/blender_copilot/data/doc_data.jsonl",
-        "general_python": "/home/mintlover/Documents/python/blender_copilot/data/general_python.jsonl",
-        "general_usage": "/home/mintlover/Documents/python/blender_copilot/data/general_data.jsonl",
+        "synthetic": os.path.join(DATA, "synthetic_training_data.jsonl"),
+        "raw_addons": os.path.join(DATA, "addons_data.jsonl"),
+        "raw_general": os.path.join(DATA, "doc_data.jsonl"),
+        "general_python": os.path.join(DATA, "general_python.jsonl"),
+        "general_usage": os.path.join(DATA, "general_data.jsonl"),
     },
     "ratios": {
         "synthetic": 0.35,
@@ -24,116 +39,174 @@ CONFIG = {
         "general_usage": 0.1,
     },
     "target_total": 10000,
-    "output_file": "/home/mintlover/Documents/python/blender_copilot/data/training_data_final.jsonl",
-    "logging_level": logging.INFO,
+    "output": os.path.join(DATA, "final_dataset.jsonl"),
 }
 
-# Setup Logging
-logging.basicConfig(
-    level=CONFIG["logging_level"],
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("DatasetMerger")
+random.seed(SEED)
 
-class DatasetMerger:
-    """
-    Production-ready merger for JSONL datasets with ratio-based sampling
-    and total size capping.
-    """
 
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.paths = config["paths"]
-        self.ratios = config["ratios"]
-        self.target_total = config["target_total"]
-        self.output_file = config["output_file"]
+def classify_strategy(q: str, a: str) -> int:
+    """Best-effort type for rows that don't carry one (raw doc/addon sources).
+    Only assign a synthetic strategy when the row actually follows that format;
+    otherwise treat as 0 (unknown/prose) so the strict synthetic-format guard
+    does not reject raw/API-reference rows."""
+    if a.strip().startswith("1) Architecture Overview") and "2) The Code" in a:
+        return 3
+    if "<MASK>" in q:
+        return 6
+    if q.strip().startswith("Fix the bug in this Blender addon:"):
+        return 7
+    if q.strip().startswith("Refactor this Blender addon for clarity and performance:"):
+        return 8
+    if validator.extract_fences(a):
+        return 0  # raw code-only answer: validate as unknown
+    return 0  # prose / unknown
 
-    def load_samples(self, key: str, path: str, ratio: float) -> List[Dict[str, Any]]:
-        """
-        Loads samples from a JSONL file based on the ratio of the target total.
-        If the file is smaller than the calculated count, all samples are taken.
-        """
-        if not os.path.exists(path):
-            logger.warning(f"File not found for {key}: {path}. Skipping.")
-            return []
 
-        target_count = int(self.target_total * ratio)
-        logger.info(f"Processing {key}: Target count = {target_count}")
-
-        samples = []
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                # Use a list comprehension for speed, but we could iterate if files were huge
-                lines = [line.strip() for line in f if line.strip()]
-            
-            total_available = len(lines)
-            if total_available == 0:
-                logger.info(f"File {key} is empty.")
-                return []
-
-            if total_available <= target_count:
-                logger.info(f"File {key} has {total_available} samples (<= target {target_count}). Taking all.")
-                sampled_lines = lines
-            else:
-                logger.info(f"Sampling {target_count} out of {total_available} from {key}.")
-                sampled_lines = random.sample(lines, target_count)
-
-            # Parse JSON
-            parsed_samples = []
-            for line in tqdm(sampled_lines, desc=f"Parsing {key}", leave=False):
-                try:
-                    parsed_samples.append(json.loads(line))
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to decode JSON line in {key}: {e}")
-            
-            return parsed_samples
-
-        except Exception as e:
-            logger.exception(f"An error occurred while loading {key}: {e}")
-            return []
-
-    def run(self):
-        """
-        Executes the merge process: Load -> Shuffle -> Save.
-        """
-        all_data = []
-        
-        # 1. Load data based on config
-        for key, path in self.paths.items():
-            ratio = self.ratios.get(key, 0.0)
-            if ratio <= 0:
-                logger.info(f"Ratio for {key} is 0 or not defined. Skipping.")
+def load_validated(key: str, path: str) -> List[Dict]:
+    """Load a raw source, validate every row, tag kept rows. No files written."""
+    if not os.path.exists(path):
+        print(f"[{key}] file not found, skipped: {path}")
+        return []
+    kept, reasons, types = [], Counter(), Counter()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
                 continue
-            
-            samples = self.load_samples(key, path, ratio)
-            all_data.extend(samples)
+            try:
+                r = json.loads(line)
+            except Exception:
+                reasons["json_error"] += 1
+                continue
+            q, a = r.get("question", ""), r.get("answer", "")
+            # New v2 schema stores messages instead of question/answer
+            msgs = r.get("messages")
+            if (not q or not a) and isinstance(msgs, list):
+                for m in msgs:
+                    if m.get("role") == "user":
+                        q = m.get("content", "")
+                    elif m.get("role") == "assistant":
+                        a = m.get("content", "")
+            if not isinstance(q, str) or not isinstance(a, str) \
+                    or not q.strip() or not a.strip():
+                reasons["empty_or_non_string"] += 1
+                continue
+            # normalize raw code-only answers (e.g. addons files) into fences
+            if "```python" not in a and validator.is_raw_code(a):
+                a = f"```python\n{a.strip()}\n```"
+            if "seed_id" in r or "task_type" in r:  # synthetic rows know their type
+                strategy = int(r.get("type", 0))
+            else:
+                strategy = classify_strategy(q, a)
+            ok, reason = validator.validate_sample(q, a, strategy, seen_hashes=None,
+                                                   strict_format=False)
+            if not ok:
+                reasons[reason] += 1
+                continue
+            row_type = "reference" if reason == "ok_reference" else str(strategy)
+            types[row_type] += 1
+            # Keep Q/A pair plus chat-style messages. `_type`/`_source` are only
+            # used internally for capping and are stripped before writing.
+            kept.append({
+                "question": q,
+                "answer": a,
+                "messages": [
+                    {"role": "user", "content": q},
+                    {"role": "assistant", "content": a},
+                ],
+                "_type": row_type,
+                "_source": key,
+            })
+    print(f"[{key}] {len(kept)} valid / {sum(reasons.values())} rejected "
+          f"-> types {dict(types.most_common())}; top rejects: {dict(reasons.most_common(3))}")
+    return kept
 
-        if not all_data:
-            logger.error("No data loaded from any source. Aborting.")
-            return
 
-        logger.info(f"Total samples collected: {len(all_data)}")
+def norm_q(q: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", q.lower())).strip()
 
-        # 2. Cap total size if we over-sampled (though ratio sum <= 1.0 usually prevents this)
-        if len(all_data) > self.target_total:
-            logger.info(f"Total samples ({len(all_data)}) exceed cap ({self.target_total}). Capping.")
-            all_data = random.sample(all_data, self.target_total)
 
-        # 3. Shuffle the final dataset
-        logger.info("Shuffling final dataset...")
-        random.shuffle(all_data)
+def dedup(rows: List[Dict]) -> List[Dict]:
+    seen_hash, seen_q, seen_words = set(), set(), set()
+    kept = []
+    d_code = d_q = d_near = 0
+    for r in rows:
+        q, a = r.get("question", ""), r.get("answer", "")
+        h = validator.code_hash(a)
+        nq = norm_q(q)
+        ws = set(nq.split())
+        nw = " ".join(sorted(ws)) if len(ws) >= 4 else None
+        if h in seen_hash:
+            d_code += 1
+            continue
+        if nq in seen_q:
+            d_q += 1
+            continue
+        if nw and nw in seen_words:
+            d_near += 1
+            continue
+        seen_hash.add(h)
+        seen_q.add(nq)
+        if nw:
+            seen_words.add(nw)
+        kept.append(r)
+    print(f"[dedup] -{d_code} dup code, -{d_q} dup question, -{d_near} near-dup -> {len(kept)}")
+    return kept
 
-        # 4. Write to output file
-        try:
-            logger.info(f"Writing to {self.output_file}...")
-            with open(self.output_file, "w", encoding="utf-8") as f:
-                for item in tqdm(all_data, desc="Saving data"):
-                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
-            logger.info(f"Successfully merged dataset. Final size: {len(all_data)}")
-        except Exception as e:
-            logger.exception(f"Failed to write output file: {e}")
+
+def cap_types(rows: List[Dict]) -> List[Dict]:
+    by_type = {}
+    for r in rows:
+        by_type.setdefault(r.get("_type", "?"), []).append(r)
+    for v in by_type.values():
+        random.shuffle(v)
+    # Cap every type at 35% of the pre-cap total; keep smaller types untouched.
+    total = sum(len(v) for v in by_type.values())
+    cap = int(TYPE_CAP * total)
+    final = [r for v in by_type.values() for r in v[:cap]]
+    print(f"[cap {int(TYPE_CAP*100)}%] {len(rows)} -> {len(final)}; "
+          f"per type: {dict(Counter(r.get('_type', '?') for r in final).most_common())}")
+    return final
+
+
+def main():
+    validator.load_cache()
+    all_rows = []
+    for key, path in CONFIG["paths"].items():
+        ratio = CONFIG["ratios"].get(key, 0)
+        if ratio <= 0:
+            continue
+        valid = load_validated(key, path)
+        target = int(CONFIG["target_total"] * ratio)
+        if len(valid) > target:
+            random.shuffle(valid)
+            valid = valid[:target]
+            print(f"[{key}] sampled down to {target} (ratio {ratio})")
+        all_rows.extend(valid)
+
+    if not all_rows:
+        sys.exit("No valid data from any source, aborting.")
+    rows = cap_types(dedup(all_rows))
+    random.shuffle(rows)
+
+    n_val = max(1, int(len(rows) * VAL_SPLIT))
+    for i, r in enumerate(rows):
+        r["split"] = "validation" if i < n_val else "train"
+
+    # Write only the Q/A pair (chat format) and split; drop internal metadata.
+    with open(CONFIG["output"], "w", encoding="utf-8") as f:
+        for r in rows:
+            out = {
+                "question": r["question"],
+                "answer": r["answer"],
+                "messages": r["messages"],
+                "split": r["split"],
+            }
+            f.write(json.dumps(out, ensure_ascii=False) + "\n")
+    print(f"[out] {CONFIG['output']} ({len(rows)} rows: "
+          f"{len(rows) - n_val} train + {n_val} validation)")
+    print("      per type:", dict(Counter(r.get('_type', '?') for r in rows).most_common()))
+
 
 if __name__ == "__main__":
-    merger = DatasetMerger(CONFIG)
-    merger.run()
+    main()

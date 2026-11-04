@@ -1,5 +1,9 @@
-from dotenv import load_dotenv
-load_dotenv()
+"""Synthetic training-data generator for the Blender QLoRA model.
+
+Output rows stay {"question", "answer"} (plain strings) for training-script
+compatibility. All code answers are ```python-fenced and validated against
+the real Blender API (see validator.py) before being written.
+"""
 import os
 import logging
 import json
@@ -8,11 +12,14 @@ import random
 import requests
 import re
 import threading
+import subprocess
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from typing import List, Dict, Any
+from typing import Dict, List, Any, Optional
 
-# Initialize logging
+import validator
+
 logging.basicConfig(
     filename='/home/mintlover/Documents/python/blender_copilot/generation.log',
     level=logging.INFO,
@@ -20,179 +27,406 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
 CONFIG = {
     "omniroute_url": "http://localhost:20128/v1/chat/completions",
     "seed_file": "/home/mintlover/Documents/python/blender_copilot/data/doc_data.jsonl",
     "output_file": "/home/mintlover/Documents/python/blender_copilot/data/synthetic_training_data.jsonl",
-    "model": "auto/coding", # Using specialized coding route for high-capacity models
-    "batch_size": 10,
+    "models_url": "http://localhost:20128/v1/models",
+    # "all" (default) = use every model OmniRoute exposes, round-robin.
+    # Set OMNIRoute_MODEL=<model id> to force a single model instead.
+    "model": os.environ.get("OMNIRoute_MODEL", "all"),
+    # extra regex of model ids to skip (e.g. "gpt-oss-20b|small")
+    "exclude": os.environ.get("OMNIRoute_EXCLUDE", ""),
+    "max_llm_attempts": 6,  # each retry goes to a DIFFERENT model
+    "temperature": 0.2,   # factual code: low temperature
+    "max_workers": 10,
+    "cap": 1000,
+    "max_retries": 3,
 }
 
-def clean_json_response(text: str) -> str:
+# Grounding text appended to every generation prompt (STEP 4)
+GROUNDING = ("Use ONLY APIs that appear in the provided reference snippet or that you "
+             "are certain exist in Blender 4.x. If unsure, do not use it. Target Blender 4.x. "
+             "All code MUST be inside ```python fenced blocks.")
+
+FORMAT_SPEC = (
+    "Respond in EXACTLY this delimiter format, no JSON, no prose outside the "
+    "requested sections, no other text:\n"
+    "===QUESTION===\n<question text>\n"
+    "===ANSWER===\n<answer text>\n"
+    "For architect answers (types 3-5) the answer must start with "
+    "'1) Architecture Overview', contain '2) The Code', and end after the single "
+    "```python ... ``` block.\n"
+    "For coder answers (types 6-8) the answer must be exactly one "
+    "```python ... ``` block and nothing else."
+)
+
+ARCH_SYSTEM = ("You are a world-class Blender API Architect. Write for Blender 4.x only. "
+               "The 'answer' MUST be markdown starting with '1) Architecture Overview' and "
+               "containing a '2) The Code' section whose code is inside ```python fences. "
+               "Use ONLY APIs from the provided reference or ones you are certain exist. "
+               "If unsure, do not use it.")
+
+CODER_SYSTEM = ("You are a precise Blender addon coder. Write for Blender 4.x only. "
+                "The 'answer' MUST be exactly one ```python fenced code block and nothing else. "
+                "Use ONLY APIs from the provided reference or ones you are certain exist. "
+                "If unsure, do not use it.")
+
+
+# ==============================================================================
+# MODEL POOL: round-robin over every model OmniRoute exposes (no combos)
+# ==============================================================================
+class ModelPool:
+    # non-chat models that show up in /v1/models
+    NON_CHAT = re.compile(r"embed|whisper|tts|speech|transcri|rerank|moderation|"
+                          r"image|dall|sdxl|flux|stable-diffusion", re.I)
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.models: List[str] = []
+        self.fails: Dict[str, int] = {}
+        self.benched: Dict[str, float] = {}   # model -> time.time() until it is skipped
+        self.i = 0
+
+    def refresh(self, headers: Dict[str, str]) -> None:
+        forced = CONFIG["model"]
+        if forced and forced.lower() != "all":
+            self.models = [forced]
+            return
+        r = requests.get(CONFIG["models_url"], headers=headers, timeout=20)
+        r.raise_for_status()
+        ids = [m["id"] for m in r.json().get("data", []) if m.get("id")]
+        ids = [m for m in ids if not self.NON_CHAT.search(m)]
+        if CONFIG["exclude"]:
+            ids = [m for m in ids if not re.search(CONFIG["exclude"], m)]
+        if not ids:
+            raise RuntimeError("OmniRoute returned no usable models")
+        self.models = sorted(set(ids))
+
+    def next(self) -> str:
+        with self.lock:
+            now = time.time()
+            live = [m for m in self.models if self.benched.get(m, 0) <= now]
+            if not live:  # everything benched: give them all another chance
+                self.benched.clear()
+                live = list(self.models)
+            m = live[self.i % len(live)]
+            self.i += 1
+            return m
+
+    def ok(self, model: str) -> None:
+        with self.lock:
+            self.fails[model] = 0
+
+    def bad(self, model: str, cooldown: int = 0, hard: bool = False) -> None:
+        """hard=True (401/402/403/404): bench for an hour. Otherwise bench for
+        `cooldown` seconds, or after 3 consecutive failures for 5 minutes."""
+        with self.lock:
+            self.fails[model] = self.fails.get(model, 0) + 1
+            if hard:
+                self.benched[model] = time.time() + 3600
+            elif cooldown:
+                self.benched[model] = time.time() + cooldown
+            elif self.fails[model] >= 3:
+                self.benched[model] = time.time() + 300
+            else:
+                return
+        logger.warning(f"Benched model {model} (fails={self.fails[model]})")
+
+
+POOL = ModelPool()
+
+
+def _headers() -> Dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OMNIRoute_API_KEY', 'sk-no-key')}",
+    }
+
+
+# ==============================================================================
+# LLM TRANSPORT (each retry rotates to the next model)
+# ==============================================================================
+def call_llm(prompt: str, system_prompt: str) -> str:
+    for attempt in range(CONFIG["max_llm_attempts"]):
+        model = POOL.next()
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": CONFIG["temperature"],
+            "max_tokens": 2000,
+        }
+        try:
+            response = requests.post(CONFIG["omniroute_url"], headers=_headers(),
+                                     json=payload, timeout=120)
+            status = response.status_code
+            if status == 429:
+                POOL.bad(model, cooldown=60)
+                logger.warning(f"{model}: rate limited, rotating")
+                continue
+            if status in (401, 402, 403, 404):  # auth / out of credit / model gone
+                POOL.bad(model, hard=True)
+                logger.error(f"{model}: HTTP {status}, benched")
+                continue
+            if status >= 500:
+                POOL.bad(model)
+                logger.warning(f"{model}: server error {status}, rotating")
+                continue
+            response.raise_for_status()
+            text = response.json()["choices"][0]["message"]["content"].strip()
+            if not text:
+                POOL.bad(model)
+                continue
+            POOL.ok(model)
+            return text
+        except Exception as e:
+            POOL.bad(model)
+            logger.warning(f"{model}: call failed ({e}), rotating")
+            time.sleep(0.5)
+    return ""
+
+
+def parse_delimited(text: str) -> Dict[str, str]:
+    """Parse the ===QUESTION=== / ===ANSWER=== format. No JSON anywhere, so
+    embedded code needs no escaping and cannot be corrupted by un-escaping."""
+    if not text:
+        return {}
     text = text.strip()
-    if text.startswith("```"):
+    if text.startswith("```"):  # model wrapped the whole reply; unwrap
         text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
-    return text.strip()
+    q = re.search(r"===QUESTION===\s*(.*?)\s*===ANSWER===", text, re.DOTALL)
+    a = re.search(r"===ANSWER===\s*(.*)", text, re.DOTALL)
+    if not q or not a:
+        return {}
+    return {"question": q.group(1).strip(), "answer": a.group(1).strip()}
 
-def call_llm(prompt: str, system_prompt: str = "You are a Blender API expert. Respond with ONLY valid JSON with keys 'question' and 'answer'.") -> str:
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {os.environ.get('OMNIROUTE_API_KEY', 'sk-no-key')}",
-    }
-    payload = {
-        "model": CONFIG["model"],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 2000,
-    }
-    try:
-        response = requests.post(CONFIG["omniroute_url"], headers=headers, json=payload, timeout=120)
-        if response.status_code == 429:
-            logger.warning("Rate limited on OmniRoute. Retrying in 5s...")
-            time.sleep(5)
-            return call_llm(prompt, system_prompt)
-        response.raise_for_status()
-        result = response.json()
-        return clean_json_response(result["choices"][0]["message"]["content"].strip())
-    except Exception as e:
-        logger.error(f"OmniRoute call failed: {e}")
-        return ""
-def parse_json_output(text: str) -> Dict[str, Any]:
-    if not text: return {}
-    cleaned = clean_json_response(text)
-    data = {}
-    try:
-        data = json.loads(cleaned)
-    except Exception:
-        try:
-            q_match = re.search(r'"question":\s*"((?:\".*?|[^"])*)"', text, re.DOTALL)
-            a_match = re.search(r'"answer":\s*"((?:\".*?|[^"])*)"', text, re.DOTALL)
-            if q_match and a_match:
-                data = {"question": q_match.group(1).replace('\\"', '"').replace('\\n', '\n'), 
-                        "answer": a_match.group(1).replace('\\"', '"').replace('\\n', '\n')}
-        except Exception:
-            pass
-    
-    if not data: return {}
-    
-    # SAFETY NET: Flatten dict-answers
-    if "answer" in data and isinstance(data["answer"], dict):
-        ans_dict = data["answer"]
-        flattened = []
-        if "Architecture Overview" in ans_dict:
-            flattened.append(f"1) Architecture Overview\n{ans_dict['Architecture Overview']}")
-        if "The Code" in ans_dict:
-            flattened.append(f"2) The Code\n{ans_dict['The Code']}")
-        for k, v in ans_dict.items():
-            if k not in ["Architecture Overview", "The Code"]:
-                flattened.append(f"{k}: {v}")
-        data["answer"] = "\n\n".join(flattened)
-        
-    return data
+
+def seed_code(seed: Dict) -> Optional[str]:
+    """Extract the seed's first ```python block. Returns None when the seed
+    has no usable fence (instead of crashing with IndexError)."""
+    code = seed.get("answer", "")
+    if not isinstance(code, str):
+        return None
+    m = re.search(r"```python\s*(.*?)```", code, re.DOTALL)
+    if not m:
+        return None
+    return m.group(1).strip() or None
+
+
+def topic_key(seed: Dict) -> str:
+    """Bucket seeds by the first API area they mention so type 4 combines
+    related seeds instead of 3 random unrelated ones."""
+    text = seed.get("question", "") + " " + seed.get("answer", "")
+    m = re.search(r"bpy\.(?:types|ops)\.(\w+)", text)
+    if m:
+        return "api:" + m.group(1)
+    return "kw:" + " ".join(seed.get("question", "").lower().split()[:4])
+
 
 # ==============================================================================
-# STRATEGIES
+# STRATEGIES (3-8). All return Dict or {} on failure. All code is fenced.
 # ==============================================================================
-def generate_type_3(seed: Dict) -> Dict:
-    """Architect: Deep dive explanation + code."""
-    code = seed.get("answer", "")
-    if "```python" in code: code = code.split("```python")[1].split("```")[0].strip()
-    prompt = f"Given this Blender Python snippet:\n\n{code}\n\nCreate a training pair where 'question' asks for a deep dive explanation and 'answer' provides a technical breakdown. The answer MUST be raw markdown text starting with '1) Architecture Overview' and including '2) The Code'. DO NOT USE JSON IN THE ANSWER. Return as JSON: {{\"question\": \"...\", \"answer\": \"...\"}}"
-    sys_p = "You are a world-class Blender API Architect. Respond with ONLY valid JSON with keys 'question' and 'answer'. The 'answer' MUST be raw markdown starting with '1) Architecture Overview' and including '2) The Code'. Provide a professional narrative deep-dive."
-    return parse_json_output(call_llm(prompt, sys_p))
+def generate_type_3(seed: Dict) -> Optional[Dict]:
+    code = seed_code(seed)
+    if not code:
+        return None
+    prompt = (f"Reference Blender Python snippet (the only allowed API source):\n\n{code}\n\n"
+              "Create a training pair where the question asks for a deep-dive explanation of "
+              "this snippet and the answer provides a technical breakdown. The answer MUST be "
+              "markdown starting with '1) Architecture Overview' and a '2) The Code' section "
+              "whose code is inside ```python fences.\n" + GROUNDING + "\n" + FORMAT_SPEC)
+    return parse_delimited(call_llm(prompt, ARCH_SYSTEM))
 
-def generate_type_4(seeds: List[Dict]) -> Dict:
-    """Architect: Combine multiple tools into one advanced tool."""
-    context = "\n".join([f"- {s['question']}: {s['answer']}" for s in seeds])
-    prompt = f"Combine these into one advanced tool:\n\n{context}\n\nReturn as JSON where 'answer' is raw markdown text starting with '1) Architecture Overview' and including '2) The Code'. DO NOT USE JSON IN THE ANSWER. Format: {{\"question\": \"...\", \"answer\": \"...\"}}"
-    sys_p = "You are a world-class Blender API Architect. Respond with ONLY valid JSON with keys 'question' and 'answer'. The 'answer' MUST be raw markdown starting with '1) Architecture Overview' and including '2) The Code'. Provide a professional narrative deep-dive."
-    return parse_json_output(call_llm(prompt, sys_p))
 
-def generate_type_5(seed: Dict) -> Dict:
-    """Architect: Buggy version and a fix (with explanation)."""
-    code = seed.get("answer", "")
-    if "```python" in code: code = code.split("```python")[1].split("```")[0].strip()
-    prompt = f"Given this correct code:\n\n{code}\n\nCreate a buggy version and a fix. The answer MUST be raw markdown text starting with '1) Architecture Overview' and including '2) The Code'. DO NOT USE JSON IN THE ANSWER. Return as JSON: {{\"question\": \"...\", \"answer\": \"...\"}}"
-    sys_p = "You are a world-class Blender API Architect. Respond with ONLY valid JSON with keys 'question' and 'answer'. The 'answer' MUST be raw markdown starting with '1) Architecture Overview' and including '2) The Code'. Provide a professional narrative deep-dive."
-    return parse_json_output(call_llm(prompt, sys_p))
+def generate_type_4(seeds: List[Dict]) -> Optional[Dict]:
+    prompt = ("Reference snippets (the only allowed API source):\n\n"
+              + "\n\n".join(f"- {s['question']}: {s['answer']}" for s in seeds)
+              + "\n\nCombine these into one advanced tool. The answer MUST be markdown starting "
+              "with '1) Architecture Overview' and a '2) The Code' section whose code is inside "
+              "```python fences.\n" + GROUNDING + "\n" + FORMAT_SPEC)
+    return parse_delimited(call_llm(prompt, ARCH_SYSTEM))
 
-def generate_type_6(seed: Dict) -> Dict:
-    """Pure Coder: Code Completion (FIM)."""
-    code = seed.get("answer", "")
-    if "```python" in code: code = code.split("```python")[1].split("```")[0].strip()
+
+def generate_type_5(seed: Dict) -> Optional[Dict]:
+    code = seed_code(seed)
+    if not code:
+        return None
+    prompt = (f"Reference correct Blender code (the only allowed API source):\n\n{code}\n\n"
+              "Create a training pair: the question shows a subtly buggy version of this code "
+              "and asks to fix it; the answer explains the bug and provides the fix. The answer "
+              "MUST be markdown starting with '1) Architecture Overview' and a '2) The Code' "
+              "section whose code is inside ```python fences.\n"
+              + GROUNDING + "\n" + FORMAT_SPEC)
+    return parse_delimited(call_llm(prompt, ARCH_SYSTEM))
+
+
+def generate_type_6(seed: Dict) -> Optional[Dict]:
+    code = seed_code(seed)
+    if not code:
+        return None
     mid = len(code) // 2
-    prefix = code[:mid]
-    suffix = code[mid:]
-    prompt = f"Task: Code Completion. \nGiven the prefix:\n{prefix}\n\nand the suffix:\n{suffix}\n\nCreate a training pair. The 'question' should be the prefix and suffix combined (e.g. 'Prefix... <MASK> ...Suffix'). The 'answer' MUST be ONLY the missing middle code. \n\nSTRICTLY FORBIDDEN: \n- NO 'Architecture Overview'\n- NO explanations\n- NO 'The Code' section\n- NO markdown surrounding the answer\n\nSTART IMMEDIATELY WITH THE CODE. Return as JSON: {{\"question\": \"...\", \"answer\": \"...\"}}"
-    sys_p = "You are a raw code generator. Respond with ONLY valid JSON with keys 'question' and 'answer'. The 'answer' MUST be raw code. NEVER use the words 'Architecture' or 'Overview'. NEVER explain yourself. JUST CODE."
-    return parse_json_output(call_llm(prompt, sys_p))
+    prefix, suffix = code[:mid], code[mid:]
+    prompt = (f"Task: code completion (fill-in-the-middle).\n\n"
+              f"Prefix:\n{prefix}\n\nSuffix:\n{suffix}\n\n"
+              "The question MUST be the prefix and suffix joined by a single <MASK> marker. "
+              "The answer MUST be ONLY the missing middle code inside one ```python fence, "
+              "no prose, no explanations, no 'Architecture' or 'Overview'.\n"
+              + GROUNDING + "\n" + FORMAT_SPEC)
+    return parse_delimited(call_llm(prompt, CODER_SYSTEM))
 
-def generate_type_7(seed: Dict) -> Dict:
-    """Pure Coder: Buggy -> Fixed (No Fluff)."""
-    code = seed.get("answer", "")
-    if "```python" in code: code = code.split("```python")[1].split("```")[0].strip()
-    prompt = f"Given this correct code:\n\n{code}\n\nCreate a 'Fix this bug' pair. The 'question' must be a buggy version of the code. The 'answer' MUST be the corrected version. \n\nSTRICTLY FORBIDDEN: \n- NO 'Architecture Overview'\n- NO explanations\n- NO 'The Code' section\n\nSTART IMMEDIATELY WITH THE CODE in a markdown block. Return as JSON: {{\"question\": \"...\", \"answer\": \"...\"}}"
-    sys_p = "You are a raw code generator. Respond with ONLY valid JSON with keys 'question' and 'answer'. The 'answer' MUST be raw code. NEVER use the words 'Architecture' or 'Overview'. NEVER explain yourself. JUST CODE."
-    return parse_json_output(call_llm(prompt, sys_p))
 
-def generate_type_8(seed: Dict) -> Dict:
-    """Pure Coder: Junior -> Senior Refactor."""
-    code = seed.get("answer", "")
-    if "```python" in code: code = code.split("```python")[1].split("```")[0].strip()
-    prompt = f"Given this correct code:\n\n{code}\n\nCreate a 'Refactor' pair. The 'question' should be a 'Junior' version (working but messy). The 'answer' MUST be the 'Senior' version (optimized). \n\nSTRICTLY FORBIDDEN: \n- NO 'Architecture Overview'\n- NO explanations\n- NO 'The Code' section\n\nSTART IMMEDIATELY WITH THE CODE. Return as JSON: {{\"question\": \"...\", \"answer\": \"...\"}}"
-    sys_p = "You are a raw code generator. Respond with ONLY valid JSON with keys 'question' and 'answer'. The 'answer' MUST be raw code. NEVER use the words 'Architecture' or 'Overview'. NEVER explain yourself. JUST CODE."
-    return parse_json_output(call_llm(prompt, sys_p))
+def generate_type_7(seed: Dict) -> Optional[Dict]:
+    code = seed_code(seed)
+    if not code:
+        return None
+    prompt = (f"Reference correct Blender code (the only allowed API source):\n\n{code}\n\n"
+              "Create a 'Fix this bug' pair. The question MUST start with the instruction "
+              "'Fix the bug in this Blender addon:' followed by a ```python-fenced buggy "
+              "version of the code (the bug must be logic or API misuse, never an invented "
+              "API). The answer MUST be only one ```python-fenced corrected version, no prose.\n"
+              + GROUNDING + "\n" + FORMAT_SPEC)
+    return parse_delimited(call_llm(prompt, CODER_SYSTEM))
+
+
+def generate_type_8(seed: Dict) -> Optional[Dict]:
+    code = seed_code(seed)
+    if not code:
+        return None
+    prompt = (f"Reference correct Blender code (the only allowed API source):\n\n{code}\n\n"
+              "Create a 'Refactor' pair. The question MUST start with the instruction "
+              "'Refactor this Blender addon for clarity and performance:' followed by a "
+              "```python-fenced working-but-messy 'Junior' version. The answer MUST be only "
+              "one ```python-fenced optimized 'Senior' version, no prose.\n"
+              + GROUNDING + "\n" + FORMAT_SPEC)
+    return parse_delimited(call_llm(prompt, CODER_SYSTEM))
+
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
 def main():
-    print("--- SCRIPT STARTING (EXTERNAL FREE MODELS) ---")
-    logger.info("Starting generation process using free high-quality models")
-    existing_count = 0
+    parser = argparse.ArgumentParser(description="Synthetic Blender training-data generator")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="process at most N unprocessed seeds this run (0 = all)")
+    parser.add_argument("--show", type=int, default=0,
+                        help="print N random accepted samples at the end")
+    args = parser.parse_args()
+    print("--- SCRIPT STARTING ---")
+    logger.info("Starting validated generation process")
+
+    validator.load_cache()  # builds data/bpy_api_cache.json headless if missing
+    POOL.refresh(_headers())
+    print(f"Using {len(POOL.models)} models: {', '.join(POOL.models)}")
+    logger.info(f"Models: {POOL.models}")
+
+    with open(CONFIG["seed_file"], 'r', encoding='utf-8') as f:
+        seeds = [json.loads(line) for line in f if line.strip()]
+    print(f"Loaded {len(seeds)} seeds.")
+
+    # dedup baseline + resume: seed_ids and code hashes already in the output
+    seen_hashes = set()
+    done = set()
+    accepted = 0
     if os.path.exists(CONFIG['output_file']):
         with open(CONFIG['output_file'], 'r', encoding='utf-8') as f:
-            existing_count = sum(1 for _ in f)
-    print(f"Resuming from sample {existing_count}...")
-    CAP = 1000
-    if existing_count >= CAP:
-        print(f"Already reached the cap of {CAP} samples. Nothing to do.")
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    if isinstance(r.get("answer"), str):
+                        seen_hashes.add(validator.code_hash(r["answer"]))
+                        accepted += 1
+                    if isinstance(r.get("seed_id"), int):
+                        done.add(r["seed_id"])
+                except Exception:
+                    pass
+    print(f"Resuming: {accepted} samples on disk, {len(done)} seeds already processed.")
+
+    if accepted >= CONFIG["cap"]:
+        print(f"Already reached the cap of {CONFIG['cap']}. Nothing to do.")
         return
-    try:
-        with open(CONFIG['seed_file'], 'r', encoding='utf-8') as f:
-            seeds = [json.loads(line) for line in f if line.strip()]
-        print(f"Loaded {len(seeds)} seeds.")
-        def run_one(i: int) -> Dict:
-            seed = seeds[i]
-            # Rotate through 6 strategies: 3 Architect (3,4,5) and 3 Pure Coder (6,7,8)
-            gen_type = (i % 6) + 3
-            if gen_type == 3: return generate_type_3(seed)
-            if gen_type == 4: return generate_type_4([seed] + random.sample(seeds, 2))
-            if gen_type == 5: return generate_type_5(seed)
-            if gen_type == 6: return generate_type_6(seed)
-            if gen_type == 7: return generate_type_7(seed)
-            return generate_type_8(seed)
-        indices = list(range(existing_count, min(len(seeds), CAP)))
-        
-        # Use moderate concurrency to avoid instant 429s
-        with open(CONFIG['output_file'], 'a', encoding='utf-8') as out_f:
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                futures = {pool.submit(run_one, i): i for i in indices}
-                for fut in tqdm(as_completed(futures), total=len(futures), desc="Generating"):
-                    i = futures[fut]
-                    try:
-                        res = fut.result()
-                        if res and "question" in res and "answer" in res and not is_hallucination(res["answer"]):
-                            out_f.write(json.dumps(res) + "\n")
-                            out_f.flush()
-                    except Exception as e:
-                        logger.error(f"Seed {i} failed: {e}")
-    except Exception as e:
-        logger.critical(f"Main loop crashed: {e}", exc_info=True)
+
+    # topic buckets for type 4 (related seeds only)
+    buckets: Dict[str, List[int]] = {}
+    for i, s in enumerate(seeds):
+        buckets.setdefault(topic_key(s), []).append(i)
+
+    stats = validator.RejectionStats()
+    accepted_rows = []  # for --show
+    lock = threading.Lock()
+
+    def run_one(i: int) -> None:
+        seed = seeds[i]
+        gen_type = (i % 6) + 3
+        for attempt in range(CONFIG["max_retries"]):
+            if gen_type == 4:
+                same = [j for j in buckets[topic_key(seed)] if j != i]
+                if len(same) < 2:
+                    stats.record(gen_type, "no_related_seeds")
+                    return
+                res = generate_type_4([seed] + [seeds[j] for j in random.sample(same, 2)])
+            else:
+                res = {3: generate_type_3, 5: generate_type_5, 6: generate_type_6,
+                       7: generate_type_7, 8: generate_type_8}[gen_type](seed)
+            if res is None:
+                stats.record(gen_type, "seed_unusable")
+                return
+            if not res:
+                stats.record(gen_type, "llm_empty_or_unparsed")
+                continue
+            # !!! Why validate format before the Blender-API check?
+            # Because a malformed Q&A pair is useless for supervised fine-tuning
+            # even if the code is correct; the model learns from the exact
+            # question/answer text, so shape and fences matter as much as API.
+            ok, reason = validator.validate_sample(res["question"], res["answer"],
+                                                   gen_type, seen_hashes)
+            stats.record(gen_type, reason)
+            if ok:
+                row = {"question": res["question"], "answer": res["answer"],
+                       "type": str(gen_type), "seed_id": i, "source": "synthetic"}
+                with lock:
+                    # another thread may have hit the cap while this one was validating
+                    if state["accepted"] >= CONFIG["cap"]:
+                        return
+                    with open(CONFIG['output_file'], 'a', encoding='utf-8') as out_f:
+                        out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    state["accepted"] += 1
+                    accepted_rows.append(row)
+            return
+        stats.record(gen_type, "retries_exhausted")
+
+    # shortcut: failed seeds are retried on every restart (resume only knows
+    # accepted seed_ids); fine while seeds are plentiful, add a skip-file if
+    # rejected seeds start burning quota
+    todo = [i for i in range(len(seeds)) if i not in done]
+    if args.limit:
+        todo = todo[:args.limit]
+    state = {"accepted": accepted}
+    with ThreadPoolExecutor(max_workers=CONFIG["max_workers"]) as pool:
+        futures = []
+        for i in todo:
+            with lock:
+                if state["accepted"] >= CONFIG["cap"]:
+                    break
+            futures.append(pool.submit(run_one, i))
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Generating"):
+            try:
+                fut.result()
+            except Exception as e:
+                logger.error(f"Seed task failed: {e}")
+
+    print("\n--- RUN REPORT (per type / rejection reason) ---")
+    print(stats.report())
+    if args.show and accepted_rows:
+        print(f"\n--- {min(args.show, len(accepted_rows))} RANDOM ACCEPTED SAMPLES ---")
+        for row in random.sample(accepted_rows, min(args.show, len(accepted_rows))):
+            print(f"\n{'='*70}\n[type={row['type']} seed={row['seed_id']}]\n"
+                  f"QUESTION: {row['question']}\n\nANSWER: {row['answer']}")
     print("--- SCRIPT FINISHED ---")
+
 
 if __name__ == "__main__":
     main()
