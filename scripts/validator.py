@@ -1,6 +1,6 @@
 """Static validation for synthetic Blender Q&A samples.
 
-Ground truth is data/bpy_api_cache.json built by build_api_cache.py.
+Ground truth is data/generated/bpy_api_cache.json built by build_api_cache.py.
 """
 import ast
 import hashlib
@@ -12,14 +12,13 @@ import warnings
 from collections import Counter
 from typing import Optional
 
-import blender_config
+import config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(HERE, "..", "data")
-CACHE_PATH = os.path.join(DATA_DIR, "bpy_api_cache.json")
-DOC_FILE = os.path.join(DATA_DIR, "doc_data.jsonl")
-BLENDER_BIN = blender_config.BLENDER_BIN
-TARGET_BLENDER = blender_config.TARGET_BLENDER
+CACHE_PATH = str(config.CACHE_PATH)
+DOC_FILE = str(config.DOC_FILE)
+BLENDER_BIN = config.BLENDER_BIN
+TARGET_BLENDER = config.TARGET_BLENDER
 
 FENCE_RE = re.compile(r"```python(.*?)```", re.DOTALL)
 BPY_RE = re.compile(r"\bbpy\.([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*)")
@@ -27,6 +26,14 @@ BL_RE = re.compile(r"^\s*(bl_\w+)\s*[:=]", re.MULTILINE)
 FAKE_NAMES = {"add_per_event", "bl_wide", "bl_height"}
 VALID_BL_EXTRA = {"bl_info"}
 VALID_STATUS = {"FINISHED", "CANCELLED", "PASS_THROUGH", "RUNNING_MODAL", "INTERFACE"}
+
+# Old generator template; stripped when merging old rows in combine_data.
+LEGACY_HEADING_RE = re.compile(
+    r"^[12]\) (?:Architecture Overview|The Code)[ \t]*\n(?:[ \t]*\n)?", re.MULTILINE)
+
+
+def normalize_answer(answer: str) -> str:
+    return LEGACY_HEADING_RE.sub("", answer).lstrip("\n")
 
 _cache = None
 
@@ -335,7 +342,7 @@ def _check_deprecated(code: str):
             sub = ".".join(parts[:i])
             if sub in deprecated:
                 reasons.append(f"deprecated:{sub}")
-        # attribute-level heuristics for common 4.x removals
+        # attribute-level heuristics for common 4.x/5.x removals
         if parts[-1] in deprecated_attrs:
             reasons.append(f"deprecated_attr:{parts[-1]}")
     return reasons
@@ -386,7 +393,9 @@ def validate_static(question: str, answer: str, task_type: str,
 
     # pipeline instruction leakage
     leak_markers = ("provided reference", "===question===", "===answer===",
-                    "the reference snippet", "the only allowed API source")
+                    "the reference snippet", "the only allowed API source",
+                    "combine these into one", "the answer must",
+                    "reference snippets")
     if any(m in question.lower() for m in leak_markers):
         return False, "question_leak"
 
@@ -459,16 +468,7 @@ def validate_static(question: str, answer: str, task_type: str,
 # Backward-compatible alias for older callers (keeps old combine_data working)
 def validate_sample(question: str, answer: str, strategy, seen_hashes: set = None,
                     strict_format: bool = False):
-    if isinstance(strategy, str) and strategy in (
-            "explanation", "bugfix", "bugfix_explained", "refactor", "addon", "fim"):
-        task_type = strategy
-    else:
-        try:
-            strategy = int(strategy)
-        except (TypeError, ValueError):
-            pass
-        task_type = {3: "explanation", 4: "explanation", 5: "bugfix_explained",
-                     6: "fim", 7: "bugfix", 8: "refactor"}.get(strategy, "explanation")
+    task_type = config.task_type(strategy)
     ok, reason = validate_static(question, answer, task_type, strict_format=strict_format)
     if ok and seen_hashes is not None:
         h = code_hash(answer)

@@ -10,12 +10,12 @@
    LLM rewrites the correct answer, with the failure fed back to it. The
    reference answer is tried first, so a valid one costs no extra call.
 
-Everything lands in one file, data/model_corrections.jsonl, which
-combine_data.py merges into data/final_dataset.jsonl. Resume skips questions
-already recorded there.
+Everything lands in one file, data/generated/model_corrections.jsonl, which
+combine_data.py cleans and merges into data/final/train.jsonl.
+Resume skips questions already recorded there.
 
 Usage:
-    python3 scripts/pipeline_type4.py --questions 20
+    python3 scripts/model_correction.py --questions 20
 """
 import argparse
 import json
@@ -38,10 +38,10 @@ import requests
 import execution_validator
 import generate_synthetic as big
 import validator
+import config
 
-DATA = ROOT / "data"
-SEEDS = DATA / "doc_data.jsonl"
-OUTPUT = DATA / "model_corrections.jsonl"
+SEEDS = config.DOC_FILE
+OUTPUT = config.MODEL_CORRECTIONS_FILE
 
 SMALL_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "qwen3.5:4b")
@@ -83,6 +83,7 @@ def read_jsonl(path: Path):
 
 
 def append_jsonl(path: Path, row: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -102,6 +103,10 @@ def build_questions(count: int, seeds, buckets, known: set, workers: int):
         if not res:
             return None
         q, a = res.get("question", ""), res.get("answer", "")
+        # A question that contains code fences or prompt instructions means the
+        # big model echoed the template instead of asking a question.
+        if "```" in q or "combine these into one" in q.lower():
+            return None
         ok, _ = validator.validate_sample(q, a, "explanation", strict_format=True)
         if not ok:
             return None
@@ -230,7 +235,7 @@ def main():
             "question": question,
             "answer": final,
             "type": "4",
-            "task_type": "explanation",
+            "task_type": config.task_type(4),
             "source": "model_corrections",
             "seed_ids": item.get("seed_ids", []),
             "small_model": SMALL_MODEL,

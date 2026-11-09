@@ -17,9 +17,9 @@ import tempfile
 import textwrap
 from typing import Dict, List, Tuple
 
-import blender_config
+import config
 
-BLENDER_BIN = blender_config.BLENDER_BIN
+BLENDER_BIN = config.BLENDER_BIN
 RUN_TIMEOUT = int(os.environ.get("BLENDER_EXEC_TIMEOUT", "120"))
 RESULT_START = "###EXEC_RESULT###"
 

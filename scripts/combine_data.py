@@ -1,11 +1,15 @@
-"""Combine all data sources into the final train/validation dataset.
+"""Combine and clean all data sources into one training file.
 
-Reads the RAW sources (validated here, in memory - no intermediate files):
-valid rows are kept, tagged with type/source, ratio-sampled, deduplicated
-across sources, capped at 35% per type, and split 95/5 (seed 42).
+Groups:
+  blender_core    doc_data + synthetic + model_corrections (one 70% group)
+  general_python  basic Python (10%, so general coding doesn't atrophy)
+  addons          whole source (small)
+  general_usage   whole source (small)
 
-Outputs exactly one file: data/final_dataset.jsonl (95/5 split is carried
-as a "split" field on each row: "train" or "validation").
+Cleaning happens here, before rows are merged: legacy headings stripped, raw
+code fenced, leaked prompts and rows marked validated: false dropped, duplicate
+code/questions removed, then a per-type cap. There is no separate cleaner.
+The output is question/answer only: data/final/train.jsonl.
 """
 import json
 import os
@@ -16,64 +20,63 @@ from collections import Counter
 from typing import Dict, List
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config
 import validator
 
-DATA = "/home/mintlover/Documents/python/blender_copilot/data"
 SEED = 42
 TYPE_CAP = 0.35
-VAL_SPLIT = 0.05
 
 CONFIG = {
-    "paths": {
-        # Both are synthetic rows; model_corrections is the verified type-4
-        # output of pipeline_type4.py.
-        "synthetic": [
-            os.path.join(DATA, "synthetic_training_data.jsonl"),
-            os.path.join(DATA, "model_corrections.jsonl"),
-        ],
-        "raw_addons": os.path.join(DATA, "addons_data.jsonl"),
-        "raw_general": os.path.join(DATA, "doc_data.jsonl"),
-        "general_python": os.path.join(DATA, "general_python.jsonl"),
-        "general_usage": os.path.join(DATA, "general_data.jsonl"),
-    },
-    "ratios": {
-        "synthetic": 0.35,
-        "raw_addons": 0.1,
-        "raw_general": 0.35,
-        "general_python": 0.1,
-        "general_usage": 0.1,
+    "groups": {
+        "blender_core": {
+            # Docs are the bulk; generated rows are kept in full and docs fill
+            # the rest of the group's target.
+            "paths": [
+                {"source": "doc_data", "path": str(config.DOC_FILE), "fill": True},
+                {"source": "synthetic", "path": str(config.SYNTHETIC_FILE), "keep": True},
+                {"source": "model_corrections",
+                 "path": str(config.MODEL_CORRECTIONS_FILE), "keep": True},
+            ],
+            "ratio": 0.70,
+        },
+        "general_python": {
+            "paths": [{"source": "general_python",
+                       "path": str(config.GENERAL_PYTHON_FILE), "fill": True}],
+            "ratio": 0.10,
+        },
+        "addons": {
+            "paths": [{"source": "addons",
+                       "path": str(config.ADDONS_FILE)}],
+            "ratio": None,  # whole source
+        },
+        "general_usage": {
+            "paths": [{"source": "general_usage",
+                       "path": str(config.GENERAL_DATA_FILE)}],
+            "ratio": None,  # whole source
+        },
     },
     "target_total": 10000,
-    "output": os.path.join(DATA, "final_dataset.jsonl"),
+    "output": str(config.TRAIN_FILE),
 }
 
 random.seed(SEED)
 
 
-def classify_strategy(q: str, a: str) -> int:
-    """Best-effort type for rows that don't carry one (raw doc/addon sources).
-    Only assign a synthetic strategy when the row actually follows that format;
-    otherwise treat as 0 (unknown/prose) so the strict synthetic-format guard
-    does not reject raw/API-reference rows."""
-    if a.strip().startswith("1) Architecture Overview") and "2) The Code" in a:
-        return 3
+def classify_strategy(q: str, a: str) -> str:
+    """Best-effort task type for raw rows that don't carry one."""
     if "<|fim_prefix|>" in q:
         return "fim"
-    if "<MASK>" in q:
-        return 6
     if q.strip().startswith("Fix the bug in this Blender addon:"):
-        return 7
+        return "bugfix"
     if q.strip().startswith("Refactor this Blender addon for clarity and performance:"):
-        return 8
-    if validator.extract_fences(a):
-        return 0  # raw code-only answer: validate as unknown
-    return 0  # prose / unknown
+        return "refactor"
+    return "explanation"
 
 
-def load_validated(key: str, path: str) -> List[Dict]:
-    """Load a raw source, validate every row, tag kept rows. No files written."""
+def load_clean(source: str, path: str, whole: bool = False) -> List[Dict]:
+    """Load, clean, validate, and tag one file. No rows written."""
     if not os.path.exists(path):
-        print(f"[{key}] file not found, skipped: {path}")
+        print(f"[{source}] file not found, skipped: {path}")
         return []
     kept, reasons, types = [], Counter(), Counter()
     with open(path, encoding="utf-8") as f:
@@ -98,20 +101,20 @@ def load_validated(key: str, path: str) -> List[Dict]:
                     or not q.strip() or not a.strip():
                 reasons["empty_or_non_string"] += 1
                 continue
+            if str(r.get("type")) == "6":
+                reasons["masked_completion"] += 1
+                continue
             # pipeline rows carry their Blender check result; never train on
             # a known-failing answer even if it happens to pass static checks
             if r.get("validated") is False:
                 reasons["marked_invalid"] += 1
                 continue
+            a = validator.normalize_answer(a)
             # normalize raw code-only answers (e.g. addons files) into fences
             if "```python" not in a and validator.is_raw_code(a):
                 a = f"```python\n{a.strip()}\n```"
-            if "seed_id" in r or "task_type" in r:  # synthetic rows know their type
-                strategy = r.get("type", 0)
-                try:
-                    strategy = int(strategy)
-                except (TypeError, ValueError):
-                    pass  # "fim" and other string task types
+            if "seed_id" in r or "task_type" in r or "type" in r:
+                strategy = config.task_type(r.get("type", 0))
             else:
                 strategy = classify_strategy(q, a)
             ok, reason = validator.validate_sample(q, a, strategy, seen_hashes=None,
@@ -119,21 +122,16 @@ def load_validated(key: str, path: str) -> List[Dict]:
             if not ok:
                 reasons[reason] += 1
                 continue
-            row_type = "reference" if reason == "ok_reference" else str(strategy)
+            row_type = "reference" if reason == "ok_reference" else strategy
             types[row_type] += 1
-            # Keep Q/A pair plus chat-style messages. `_type`/`_source` are only
-            # used internally for capping and are stripped before writing.
             kept.append({
                 "question": q,
                 "answer": a,
-                "messages": [
-                    {"role": "user", "content": q},
-                    {"role": "assistant", "content": a},
-                ],
                 "_type": row_type,
-                "_source": key,
+                "_source": source,
+                "_whole": whole,
             })
-    print(f"[{key}] {len(kept)} valid / {sum(reasons.values())} rejected "
+    print(f"[{source}] {len(kept)} valid / {sum(reasons.values())} rejected "
           f"-> types {dict(types.most_common())}; top rejects: {dict(reasons.most_common(3))}")
     return kept
 
@@ -148,7 +146,9 @@ def dedup(rows: List[Dict]) -> List[Dict]:
     d_code = d_q = d_near = 0
     for r in rows:
         q, a = r.get("question", ""), r.get("answer", "")
-        h = validator.code_hash(a)
+        # Task types are different training signals even when they share code:
+        # a bugfix answer and a doc explanation of the same snippet can coexist.
+        h = (r.get("_type"), validator.code_hash(a))
         nq = norm_q(q)
         ws = set(nq.split())
         nw = " ".join(sorted(ws)) if len(ws) >= 4 else None
@@ -188,44 +188,51 @@ def cap_types(rows: List[Dict]) -> List[Dict]:
 def main():
     validator.load_cache()
     all_rows = []
-    for key, paths in CONFIG["paths"].items():
-        ratio = CONFIG["ratios"].get(key, 0)
-        if ratio <= 0:
-            continue
-        if isinstance(paths, str):
-            paths = [paths]
-        valid = []
-        for path in paths:
-            valid.extend(load_validated(key, path))
-        target = int(CONFIG["target_total"] * ratio)
-        if len(valid) > target:
-            random.shuffle(valid)
-            valid = valid[:target]
-            print(f"[{key}] sampled down to {target} (ratio {ratio})")
+    for name, group in CONFIG["groups"].items():
+        whole = group["ratio"] is None
+        keep_rows, fill_rows = [], []
+        for item in group["paths"]:
+            rows = load_clean(item["source"], item["path"], whole)
+            if item.get("keep"):
+                for r in rows:
+                    r["_keep"] = True
+                keep_rows.extend(rows)
+            else:
+                fill_rows.extend(rows)
+        ratio = group["ratio"]
+        if ratio is not None:
+            target = int(CONFIG["target_total"] * ratio)
+            random.shuffle(fill_rows)
+            fill = max(0, target - len(keep_rows))
+            if len(fill_rows) > fill:
+                print(f"[{name}] kept {len(keep_rows)} generated + "
+                      f"sampled {fill}/{len(fill_rows)} docs (ratio {ratio})")
+                fill_rows = fill_rows[:fill]
+        valid = keep_rows + fill_rows
+        print(f"[{name}] {len(valid)} rows")
         all_rows.extend(valid)
 
     if not all_rows:
         sys.exit("No valid data from any source, aborting.")
-    rows = cap_types(dedup(all_rows))
+    rows = dedup(all_rows)
+    # Small sources and generated keep rows are never ratio-sampled or
+    # per-type-capped; everything else goes through the cap.
+    exempt = [r for r in rows if r.get("_whole") or r.get("_keep")]
+    rows = cap_types([r for r in rows if not (r.get("_whole") or r.get("_keep"))]) + exempt
     random.shuffle(rows)
 
-    n_val = max(1, int(len(rows) * VAL_SPLIT))
-    for i, r in enumerate(rows):
-        r["split"] = "validation" if i < n_val else "train"
-
-    # Write only the Q/A pair (chat format) and split; drop internal metadata.
-    with open(CONFIG["output"], "w", encoding="utf-8") as f:
+    out = CONFIG["output"]
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
         for r in rows:
-            out = {
-                "question": r["question"],
-                "answer": r["answer"],
-                "messages": r["messages"],
-                "split": r["split"],
-            }
-            f.write(json.dumps(out, ensure_ascii=False) + "\n")
-    print(f"[out] {CONFIG['output']} ({len(rows)} rows: "
-          f"{len(rows) - n_val} train + {n_val} validation)")
-    print("      per type:", dict(Counter(r.get('_type', '?') for r in rows).most_common()))
+            # final schema is exactly question + answer
+            f.write(json.dumps({"question": r["question"],
+                                "answer": r["answer"]},
+                               ensure_ascii=False) + "\n")
+    print(f"[out] {out} ({len(rows)} rows)")
+
+    print("      per type:",
+          dict(Counter(r.get("_type", "?") for r in rows).most_common()))
 
 
 if __name__ == "__main__":

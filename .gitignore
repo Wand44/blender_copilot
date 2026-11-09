@@ -1,6 +1,6 @@
 .venv
 .env
 .gitignore
-generation.log
+logs/
 scripts/__pycache__/
 *.bak

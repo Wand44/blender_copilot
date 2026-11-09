@@ -27,9 +27,11 @@ except ImportError:  # system python may lack the venv's python-dotenv
     pass
 import validator
 import execution_validator
+import config
 
+config.LOGS.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
-    filename='/home/mintlover/Documents/python/blender_copilot/generation.log',
+    filename=str(config.LOG_FILE),
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
@@ -37,8 +39,8 @@ logger = logging.getLogger(__name__)
 
 CONFIG = {
     "omniroute_url": "http://localhost:20128/v1/chat/completions",
-    "seed_file": "/home/mintlover/Documents/python/blender_copilot/data/doc_data.jsonl",
-    "output_file": "/home/mintlover/Documents/python/blender_copilot/data/synthetic_training_data.jsonl",
+    "seed_file": str(config.DOC_FILE),
+    "output_file": str(config.SYNTHETIC_FILE),
     "models_url": "http://localhost:20128/v1/models",
     # "all" (default) = use every model OmniRoute exposes, round-robin.
     # Set OMNIRoute_MODEL=<model id> to force a single model instead.
@@ -404,7 +406,8 @@ def main():
     print("--- SCRIPT STARTING ---")
     logger.info("Starting validated generation process")
 
-    validator.load_cache()  # builds data/bpy_api_cache.json headless if missing
+    validator.load_cache()  # builds data/generated/bpy_api_cache.json headless if missing
+    Path(CONFIG["output_file"]).parent.mkdir(parents=True, exist_ok=True)
     POOL.refresh(_headers())
     print(f"Using {len(POOL.models)} models: {', '.join(POOL.models)}")
     logger.info(f"Models: {POOL.models}")
