@@ -25,7 +25,12 @@ VAL_SPLIT = 0.05
 
 CONFIG = {
     "paths": {
-        "synthetic": os.path.join(DATA, "synthetic_training_data.jsonl"),
+        # Both are synthetic rows; model_corrections is the verified type-4
+        # output of pipeline_type4.py.
+        "synthetic": [
+            os.path.join(DATA, "synthetic_training_data.jsonl"),
+            os.path.join(DATA, "model_corrections.jsonl"),
+        ],
         "raw_addons": os.path.join(DATA, "addons_data.jsonl"),
         "raw_general": os.path.join(DATA, "doc_data.jsonl"),
         "general_python": os.path.join(DATA, "general_python.jsonl"),
@@ -52,6 +57,8 @@ def classify_strategy(q: str, a: str) -> int:
     does not reject raw/API-reference rows."""
     if a.strip().startswith("1) Architecture Overview") and "2) The Code" in a:
         return 3
+    if "<|fim_prefix|>" in q:
+        return "fim"
     if "<MASK>" in q:
         return 6
     if q.strip().startswith("Fix the bug in this Blender addon:"):
@@ -91,11 +98,20 @@ def load_validated(key: str, path: str) -> List[Dict]:
                     or not q.strip() or not a.strip():
                 reasons["empty_or_non_string"] += 1
                 continue
+            # pipeline rows carry their Blender check result; never train on
+            # a known-failing answer even if it happens to pass static checks
+            if r.get("validated") is False:
+                reasons["marked_invalid"] += 1
+                continue
             # normalize raw code-only answers (e.g. addons files) into fences
             if "```python" not in a and validator.is_raw_code(a):
                 a = f"```python\n{a.strip()}\n```"
             if "seed_id" in r or "task_type" in r:  # synthetic rows know their type
-                strategy = int(r.get("type", 0))
+                strategy = r.get("type", 0)
+                try:
+                    strategy = int(strategy)
+                except (TypeError, ValueError):
+                    pass  # "fim" and other string task types
             else:
                 strategy = classify_strategy(q, a)
             ok, reason = validator.validate_sample(q, a, strategy, seen_hashes=None,
@@ -172,11 +188,15 @@ def cap_types(rows: List[Dict]) -> List[Dict]:
 def main():
     validator.load_cache()
     all_rows = []
-    for key, path in CONFIG["paths"].items():
+    for key, paths in CONFIG["paths"].items():
         ratio = CONFIG["ratios"].get(key, 0)
         if ratio <= 0:
             continue
-        valid = load_validated(key, path)
+        if isinstance(paths, str):
+            paths = [paths]
+        valid = []
+        for path in paths:
+            valid.extend(load_validated(key, path))
         target = int(CONFIG["target_total"] * ratio)
         if len(valid) > target:
             random.shuffle(valid)

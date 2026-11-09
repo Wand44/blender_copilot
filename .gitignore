@@ -3,3 +3,4 @@
 .gitignore
 generation.log
 scripts/__pycache__/
+*.bak

@@ -70,6 +70,18 @@ def extract_fences(text: str):
     return [b for b in FENCE_RE.findall(text)]
 
 
+def fim_full_code(question: str, answer: str) -> "str | None":
+    """Rebuild the full snippet from a FIM question and its middle-span answer."""
+    m = re.search(r"<\|fim_prefix\|>(.*?)<\|fim_suffix\|>(.*?)<\|fim_middle\|>",
+                  question, re.DOTALL)
+    if not m:
+        return None
+    blocks = extract_fences(answer)
+    middle = blocks[0] if blocks else ""
+    return "\n".join(part.strip("\n")
+                     for part in (m.group(1), middle, m.group(2)) if part)
+
+
 SIG_LINE_RE = re.compile(
     r"^\s*(?:"
     r"class\s+[\w.]+\s*\(.*\)"
@@ -329,8 +341,18 @@ def _check_deprecated(code: str):
     return reasons
 
 
+COT_MARKERS = ("wait,", "let's look closer", "hmm", "step 1")
+
+
 def validate_format(answer: str, task_type: str) -> "str | None":
-    """Enforce the output schema: short prose + exactly one ```python block."""
+    """Enforce the output schema: exactly one ```python block.
+
+    Explanation answers may carry short prose before the code. Coder answers
+    (bugfix/refactor) must be the code block alone, matching the generator
+    prompt. Any unclosed/extra fence is a truncation signal.
+    """
+    if answer.count("```") % 2:
+        return "unbalanced_fence"
     blocks = extract_fences(answer)
     if not blocks:
         if task_type == "fim":
@@ -338,17 +360,20 @@ def validate_format(answer: str, task_type: str) -> "str | None":
         return "no_code_block"
     if len(blocks) > 1:
         return "multiple_code_blocks"
+    if not blocks[0].strip():
+        return "empty_code"
+    lower = answer.lower()
+    if any(marker in lower for marker in COT_MARKERS):
+        return "chain_of_thought"
+    if not answer.rstrip().endswith("```"):
+        return "trailing_text"
     if task_type == "fim":
-        # FIM answer should be the middle span only, wrapped in python fence
         return None
-    # only explanation/refactor/bugfix tasks should have prose before the code
-    if task_type in ("explanation", "bugfix", "refactor", "addon"):
-        # allow short prose, then one code block. Reject chain-of-thought markers.
-        lower = answer.lower()
-        for marker in ("wait,", "let's look closer", "hmm", "actually,",
-                       "first,", "step 1", "architecture overview"):
-            if marker in lower:
-                return "chain_of_thought"
+    if task_type in ("bugfix", "refactor"):
+        if not answer.lstrip().startswith("```python"):
+            return "unexpected_format"
+        return None
+    if task_type in ("explanation", "addon", "bugfix_explained"):
         return None
     return "unexpected_format"
 
@@ -370,10 +395,21 @@ def validate_static(question: str, answer: str, task_type: str,
         if fmt:
             return False, fmt
 
-    code = extract_fences(answer)[0] if extract_fences(answer) else ""
-    if not code:
+    blocks = extract_fences(answer)
+    code = blocks[0] if blocks else ""
+    if task_type == "fim":
+        # The answer is only the middle span; rebuild the full snippet before
+        # parsing or API checking it.
+        code = fim_full_code(question, answer)
+        if code is None:
+            return False, "fim_markers_missing"
+    if not code.strip():
         # prose-only answer (allowed for non-synthetic sources when not strict)
         return True, "ok"
+    if task_type in ("bugfix", "refactor", "bugfix_explained"):
+        q_blocks = extract_fences(question)
+        if q_blocks and re.sub(r"\s+", "", q_blocks[0]) == re.sub(r"\s+", "", code):
+            return False, "unchanged_code"
     if not parse_ok(code):
         if is_reference_listing(code):
             err = validate_reference(code, set())
@@ -423,8 +459,16 @@ def validate_static(question: str, answer: str, task_type: str,
 # Backward-compatible alias for older callers (keeps old combine_data working)
 def validate_sample(question: str, answer: str, strategy, seen_hashes: set = None,
                     strict_format: bool = False):
-    task_type = {3: "explanation", 4: "explanation", 5: "bugfix",
-                 6: "fim", 7: "bugfix", 8: "refactor"}.get(strategy, "explanation")
+    if isinstance(strategy, str) and strategy in (
+            "explanation", "bugfix", "bugfix_explained", "refactor", "addon", "fim"):
+        task_type = strategy
+    else:
+        try:
+            strategy = int(strategy)
+        except (TypeError, ValueError):
+            pass
+        task_type = {3: "explanation", 4: "explanation", 5: "bugfix_explained",
+                     6: "fim", 7: "bugfix", 8: "refactor"}.get(strategy, "explanation")
     ok, reason = validate_static(question, answer, task_type, strict_format=strict_format)
     if ok and seen_hashes is not None:
         h = code_hash(answer)
