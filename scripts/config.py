@@ -3,6 +3,14 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Load .env without python-dotenv (not installed on the system python).
+if (ROOT / ".env").exists():
+    for _line in (ROOT / ".env").read_text().splitlines():
+        _k, _, _v = _line.partition("=")
+        if _k.strip() and _v.strip():
+            os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
 DATA = ROOT / "data"
 RAW = DATA / "raw"          # hand-collected / extracted sources
 GENERATED = DATA / "generated"  # pipeline outputs
@@ -28,6 +36,8 @@ MODEL_CORRECTIONS_FILE = GENERATED / "model_corrections.jsonl"
 
 # Training-ready output (question/answer only)
 TRAIN_FILE = FINAL / "train.jsonl"
+VAL_FILE = FINAL / "val.jsonl"
+PREFERENCE_FILE = FINAL / "preference_pairs.jsonl"
 
 LOG_FILE = LOGS / "generation.log"
 
