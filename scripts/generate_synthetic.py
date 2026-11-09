@@ -5,6 +5,7 @@ compatibility. All code answers are ```python-fenced and validated against
 the real Blender API (see validator.py) before being written.
 """
 import os
+import ast
 import logging
 import json
 import time
@@ -15,10 +16,17 @@ import threading
 import subprocess
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from tqdm import tqdm
 from typing import Dict, List, Any, Optional
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:  # system python may lack the venv's python-dotenv
+    pass
 import validator
+import execution_validator
 
 logging.basicConfig(
     filename='/home/mintlover/Documents/python/blender_copilot/generation.log',
@@ -46,7 +54,7 @@ CONFIG = {
 
 # Grounding text appended to every generation prompt (STEP 4)
 GROUNDING = ("Use ONLY APIs that appear in the provided reference snippet or that you "
-             "are certain exist in Blender 4.x. If unsure, do not use it. Target Blender 4.x. "
+             "are certain exist in Blender 5.x. If unsure, do not use it. Target Blender 5.x. "
              "All code MUST be inside ```python fenced blocks.")
 
 FORMAT_SPEC = (
@@ -54,20 +62,19 @@ FORMAT_SPEC = (
     "requested sections, no other text:\n"
     "===QUESTION===\n<question text>\n"
     "===ANSWER===\n<answer text>\n"
-    "For architect answers (types 3-5) the answer must start with "
-    "'1) Architecture Overview', contain '2) The Code', and end after the single "
-    "```python ... ``` block.\n"
-    "For coder answers (types 6-8) the answer must be exactly one "
+    "For explanation answers (types 3-5) the answer must be a short explanation "
+    "followed by exactly one ```python ... ``` block and end there.\n"
+    "For coder answers (types 7-8) the answer must be exactly one "
     "```python ... ``` block and nothing else."
 )
 
-ARCH_SYSTEM = ("You are a world-class Blender API Architect. Write for Blender 4.x only. "
-               "The 'answer' MUST be markdown starting with '1) Architecture Overview' and "
-               "containing a '2) The Code' section whose code is inside ```python fences. "
+ARCH_SYSTEM = ("You are a world-class Blender API Architect. Write for Blender 5.x only. "
+               "The 'answer' MUST be a short explanation followed by exactly one "
+               "```python fenced code block and nothing after it. "
                "Use ONLY APIs from the provided reference or ones you are certain exist. "
                "If unsure, do not use it.")
 
-CODER_SYSTEM = ("You are a precise Blender addon coder. Write for Blender 4.x only. "
+CODER_SYSTEM = ("You are a precise Blender addon coder. Write for Blender 5.x only. "
                 "The 'answer' MUST be exactly one ```python fenced code block and nothing else. "
                 "Use ONLY APIs from the provided reference or ones you are certain exist. "
                 "If unsure, do not use it.")
@@ -93,7 +100,7 @@ class ModelPool:
         if forced and forced.lower() != "all":
             self.models = [forced]
             return
-        r = requests.get(CONFIG["models_url"], headers=headers, timeout=20)
+        r = requests.get(CONFIG["models_url"], headers=headers, timeout=60)
         r.raise_for_status()
         ids = [m["id"] for m in r.json().get("data", []) if m.get("id")]
         ids = [m for m in ids if not self.NON_CHAT.search(m)]
@@ -235,19 +242,18 @@ def generate_type_3(seed: Dict) -> Optional[Dict]:
     if not code:
         return None
     prompt = (f"Reference Blender Python snippet (the only allowed API source):\n\n{code}\n\n"
-              "Create a training pair where the question asks for a deep-dive explanation of "
-              "this snippet and the answer provides a technical breakdown. The answer MUST be "
-              "markdown starting with '1) Architecture Overview' and a '2) The Code' section "
-              "whose code is inside ```python fences.\n" + GROUNDING + "\n" + FORMAT_SPEC)
+              "Create a training pair where the question asks for a concise explanation of "
+              "this snippet and the answer gives a short technical explanation followed by "
+              "exactly one ```python block.\n" + GROUNDING + "\n" + FORMAT_SPEC)
     return parse_delimited(call_llm(prompt, ARCH_SYSTEM))
 
 
 def generate_type_4(seeds: List[Dict]) -> Optional[Dict]:
     prompt = ("Reference snippets (the only allowed API source):\n\n"
               + "\n\n".join(f"- {s['question']}: {s['answer']}" for s in seeds)
-              + "\n\nCombine these into one advanced tool. The answer MUST be markdown starting "
-              "with '1) Architecture Overview' and a '2) The Code' section whose code is inside "
-              "```python fences.\n" + GROUNDING + "\n" + FORMAT_SPEC)
+              + "\n\nCombine these into one advanced tool. The answer MUST be a short "
+              "explanation followed by exactly one ```python block.\n"
+              + GROUNDING + "\n" + FORMAT_SPEC)
     return parse_delimited(call_llm(prompt, ARCH_SYSTEM))
 
 
@@ -258,25 +264,49 @@ def generate_type_5(seed: Dict) -> Optional[Dict]:
     prompt = (f"Reference correct Blender code (the only allowed API source):\n\n{code}\n\n"
               "Create a training pair: the question shows a subtly buggy version of this code "
               "and asks to fix it; the answer explains the bug and provides the fix. The answer "
-              "MUST be markdown starting with '1) Architecture Overview' and a '2) The Code' "
-              "section whose code is inside ```python fences.\n"
+              "MUST be a short explanation followed by exactly one ```python block.\n"
               + GROUNDING + "\n" + FORMAT_SPEC)
     return parse_delimited(call_llm(prompt, ARCH_SYSTEM))
 
 
-def generate_type_6(seed: Dict) -> Optional[Dict]:
-    code = seed_code(seed)
-    if not code:
+def split_fim(code: str):
+    """Split validated code at a top-level statement boundary for real FIM.
+
+    Returns (prefix, middle, suffix) or None when the snippet has no safe
+    statement to remove.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
         return None
-    mid = len(code) // 2
-    prefix, suffix = code[:mid], code[mid:]
-    prompt = (f"Task: code completion (fill-in-the-middle).\n\n"
-              f"Prefix:\n{prefix}\n\nSuffix:\n{suffix}\n\n"
-              "The question MUST be the prefix and suffix joined by a single <MASK> marker. "
-              "The answer MUST be ONLY the missing middle code inside one ```python fence, "
-              "no prose, no explanations, no 'Architecture' or 'Overview'.\n"
-              + GROUNDING + "\n" + FORMAT_SPEC)
-    return parse_delimited(call_llm(prompt, CODER_SYSTEM))
+    lines = code.splitlines()
+    # Any statement (including one inside a function/class body) can be the
+    # masked span; the full snippet is what gets validated.
+    nodes = [n for n in ast.walk(tree) if isinstance(n, ast.stmt)
+             and not isinstance(n, (ast.Import, ast.ImportFrom, ast.Pass))
+             and getattr(n, "lineno", None) and getattr(n, "end_lineno", None)]
+    nodes = [n for n in nodes
+             if not (n.lineno == 1 and n.end_lineno == len(lines))]
+    if not nodes:
+        return None
+
+    def start_line(n):
+        # A decorated function's lineno points at `def`, so keep the decorators.
+        return min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])])
+
+    mid = len(lines) / 2
+    # Prefer a span with code on both sides (real prefix + suffix), near the middle.
+    node = min(nodes, key=lambda n: (
+        not (start_line(n) > 1 and n.end_lineno < len(lines)),
+        abs((start_line(n) + n.end_lineno) / 2 - mid),
+        n.end_lineno - start_line(n)))
+    start = start_line(node)
+    prefix = "\n".join(lines[:start - 1]).strip("\n")
+    middle = "\n".join(lines[start - 1:node.end_lineno])
+    suffix = "\n".join(lines[node.end_lineno:]).strip("\n")
+    if not middle.strip() or not (prefix or suffix):
+        return None
+    return prefix, middle, suffix
 
 
 def generate_type_7(seed: Dict) -> Optional[Dict]:
@@ -308,13 +338,69 @@ def generate_type_8(seed: Dict) -> Optional[Dict]:
 # ==============================================================================
 # MAIN
 # ==============================================================================
+class RejectionStats:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.counts: Dict[tuple, int] = {}
+
+    def record(self, gen_type: int, reason: str) -> None:
+        with self.lock:
+            self.counts[(gen_type, reason)] = self.counts.get((gen_type, reason), 0) + 1
+
+    def report(self) -> str:
+        return "\n".join(f"type {t}: {r} = {n}"
+                         for (t, r), n in sorted(self.counts.items()))
+
+
+def append_fim_rows(path: str, seen_hashes: set, limit: int, execute: bool,
+                    stats: "RejectionStats") -> int:
+    """Build FIM rows from already-validated code instead of asking an LLM to
+    mask characters (the old type 6 garbage)."""
+    if limit <= 0 or not os.path.exists(path):
+        return 0
+    with open(path, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    added = 0
+    for r in rows:
+        if added >= limit:
+            break
+        if str(r.get("type")) in ("6", "fim"):
+            continue
+        blocks = validator.extract_fences(r.get("answer", ""))
+        if not blocks:
+            continue
+        parts = split_fim(blocks[0])
+        if not parts:
+            continue
+        prefix, middle, suffix = parts
+        row = {
+            "question": f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>",
+            "answer": f"```python\n{middle}\n```",
+        }
+        ok, reason = validator.validate_sample(row["question"], row["answer"], "fim",
+                                               seen_hashes, strict_format=True)
+        if ok and execute:
+            ok, reason = execution_validator.validate(prefix + "\n" + middle + "\n" + suffix)
+        if not ok:
+            stats.record(6, reason)
+            continue
+        row.update({"type": "fim", "seed_id": r.get("seed_id"), "source": "synthetic"})
+        with open(path, "a", encoding="utf-8") as out_f:
+            out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        added += 1
+    return added
+
+
 def main():
     parser = argparse.ArgumentParser(description="Synthetic Blender training-data generator")
     parser.add_argument("--limit", type=int, default=0,
                         help="process at most N unprocessed seeds this run (0 = all)")
     parser.add_argument("--show", type=int, default=0,
                         help="print N random accepted samples at the end")
+    parser.add_argument("--no-execute", action="store_true",
+                        help="skip headless-Blender execution validation")
     args = parser.parse_args()
+    execute = not args.no_execute
     print("--- SCRIPT STARTING ---")
     logger.info("Starting validated generation process")
 
@@ -354,13 +440,15 @@ def main():
     for i, s in enumerate(seeds):
         buckets.setdefault(topic_key(s), []).append(i)
 
-    stats = validator.RejectionStats()
+    stats = RejectionStats()
     accepted_rows = []  # for --show
     lock = threading.Lock()
 
     def run_one(i: int) -> None:
         seed = seeds[i]
-        gen_type = (i % 6) + 3
+        # Type 6 (masked completion) is gone; FIM rows are built from validated
+        # code after generation (append_fim_rows).
+        gen_type = (3, 4, 5, 7, 8)[i % 5]
         for attempt in range(CONFIG["max_retries"]):
             if gen_type == 4:
                 same = [j for j in buckets[topic_key(seed)] if j != i]
@@ -369,7 +457,7 @@ def main():
                     return
                 res = generate_type_4([seed] + [seeds[j] for j in random.sample(same, 2)])
             else:
-                res = {3: generate_type_3, 5: generate_type_5, 6: generate_type_6,
+                res = {3: generate_type_3, 5: generate_type_5,
                        7: generate_type_7, 8: generate_type_8}[gen_type](seed)
             if res is None:
                 stats.record(gen_type, "seed_unusable")
@@ -382,7 +470,11 @@ def main():
             # even if the code is correct; the model learns from the exact
             # question/answer text, so shape and fences matter as much as API.
             ok, reason = validator.validate_sample(res["question"], res["answer"],
-                                                   gen_type, seen_hashes)
+                                                   gen_type, seen_hashes,
+                                                   strict_format=True)
+            if ok and execute:
+                blocks = validator.extract_fences(res["answer"])
+                ok, reason = execution_validator.validate(blocks[0] if blocks else "")
             stats.record(gen_type, reason)
             if ok:
                 row = {"question": res["question"], "answer": res["answer"],
@@ -395,7 +487,7 @@ def main():
                         out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
                     state["accepted"] += 1
                     accepted_rows.append(row)
-            return
+                return
         stats.record(gen_type, "retries_exhausted")
 
     # shortcut: failed seeds are retried on every restart (resume only knows
@@ -417,6 +509,13 @@ def main():
                 fut.result()
             except Exception as e:
                 logger.error(f"Seed task failed: {e}")
+
+    # FIM needs multi-statement code; seeds are one-line API references, so
+    # build it from the code answers that just passed validation.
+    fim_limit = min(CONFIG["cap"] - state["accepted"], max(1, state["accepted"] // 4))
+    added = append_fim_rows(CONFIG["output_file"], seen_hashes, fim_limit,
+                            execute, stats)
+    print(f"Added {added} FIM rows.")
 
     print("\n--- RUN REPORT (per type / rejection reason) ---")
     print(stats.report())

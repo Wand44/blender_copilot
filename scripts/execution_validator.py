@@ -52,6 +52,8 @@ def run_code(code: str) -> Dict:
             bpy.ops.wm.read_factory_settings(use_empty=True)
             if not bpy.data.scenes:
                 bpy.data.scenes.new("Scene")
+            # Most snippets assume an active mesh; give them one.
+            bpy.ops.mesh.primitive_cube_add()
 
         result = {{"ok": False, "error": None, "error_type": None}}
         try:
@@ -105,6 +107,8 @@ def _reset():
     bpy.ops.wm.read_factory_settings(use_empty=True)
     if not bpy.data.scenes:
         bpy.data.scenes.new("Scene")
+    # Most snippets assume an active mesh; give them one.
+    bpy.ops.mesh.primitive_cube_add()
 
 in_path = sys.argv[-2]
 out_path = sys.argv[-1]
@@ -123,11 +127,26 @@ for job in jobs:
         res["error_type"] = type(e).__name__
         res["traceback"] = traceback.format_exc()
     results.append(res)
+    # Flush after every job so a crash/hang keeps the results already earned.
+    with open(out_path, "w") as f:
+        json.dump(results, f)
 
-with open(out_path, "w") as f:
-    json.dump(results, f)
 bpy.ops.wm.quit_blender()
 """
+
+
+def _merge_partial(out_path: str, jobs: List[Dict],
+                   missing_error: str, missing_type: str) -> List[Dict]:
+    """Keep every result the crashed/hung batch already flushed to disk."""
+    try:
+        with open(out_path, "r") as f:
+            partial = json.load(f)
+    except (OSError, ValueError):
+        partial = []
+    by_id = {r.get("id"): r for r in partial}
+    return [by_id.get(j["id"], {"id": j["id"], "ok": False,
+                                "error": missing_error, "error_type": missing_type})
+            for j in jobs]
 
 
 def run_batch(codes: List[str], timeout: int = RUN_TIMEOUT) -> List[Dict]:
@@ -150,21 +169,14 @@ def run_batch(codes: List[str], timeout: int = RUN_TIMEOUT) -> List[Dict]:
             [BLENDER_BIN, "-b", "--python", runner_path, "--", in_path, out_path],
             capture_output=True, text=True, timeout=timeout,
         )
-        if os.path.exists(out_path):
-            with open(out_path, "r") as f:
-                results = json.load(f)
-        else:
-            results = [{"id": j["id"], "ok": False,
-                        "error": "no result file", "error_type": "ExecutionError"}
-                       for j in jobs]
+        results = _merge_partial(out_path, jobs, "no result (batch crashed/hung)",
+                                 "ExecutionError")
     except subprocess.TimeoutExpired:
-        results = [{"id": j["id"], "ok": False,
-                    "error": f"batch timeout after {timeout}s", "error_type": "Timeout"}
-                   for j in jobs]
+        results = _merge_partial(out_path, jobs,
+                                 f"batch timeout after {timeout}s", "Timeout")
     except Exception as e:
-        results = [{"id": j["id"], "ok": False,
-                    "error": f"batch runner failed: {e}", "error_type": type(e).__name__}
-                   for j in jobs]
+        results = _merge_partial(out_path, jobs,
+                                 f"batch runner failed: {e}", type(e).__name__)
     finally:
         for p in (in_path, out_path, runner_path):
             try:
