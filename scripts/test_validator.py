@@ -97,4 +97,82 @@ with tempfile.TemporaryDirectory() as d:
     assert len(rows) == 1 and rows[0]["answer"] == "a1", rows
     assert not [r for r in rows if not r.get("answer")]
 
+# 17. execution validation needs real Blender: coverage, hidden checks, class +
+#     register exemption, and combine_data dropping "unverified" rows.
+import json
+import shutil
+import combine_data
+import execution_validator
+
+CLASS_REGISTER = (
+    "import bpy\n"
+    "class MY_OT_thing(bpy.types.Operator):\n"
+    "    bl_idname = 'object.thing'\n"
+    "    bl_label = 'Thing'\n"
+    "    def execute(self, context):\n"
+    "        return {'FINISHED'}\n"
+    "def register():\n"
+    "    bpy.utils.register_class(MY_OT_thing)\n"
+    "if __name__ == '__main__':\n"
+    "    register()\n"
+)
+UNCALLED = "import bpy\ndef foo():\n    return 1\n"
+GUARDED = "import bpy\nobj = None\nif obj:\n    obj.name = 'x'\n"
+CALLED = "import bpy\ndef foo():\n    return 1\nfoo()\n"
+ATTR_ERROR = "import bpy\nbpy.context.object.does_not_exist = 1\n"
+EMPTY = "import bpy\n"
+
+
+def check_execution():
+    codes = [UNCALLED, GUARDED, CALLED, ATTR_ERROR, CLASS_REGISTER, EMPTY, EMPTY]
+    checks = ["", "", "", "", "", "assert len(bpy.data.objects) == 1",
+              "assert len(bpy.data.objects) == 0"]
+    res = execution_validator.run_batch(codes, checks=checks)
+    assert len(res) == len(codes), res
+
+    assert res[0]["code_ok"] and res[0]["coverage"] < 0.8, res[0]
+    assert res[1]["code_ok"] and res[1]["coverage"] < 0.8, res[1]
+    assert res[2]["code_ok"] and res[2]["coverage"] == 1.0, res[2]
+
+    assert not res[3]["ok"] and res[3]["error_type"] == "AttributeError", res[3]
+
+    assert res[4]["code_ok"] and execution_validator.is_class_register(CLASS_REGISTER), res[4]
+
+    assert res[5]["ok"] and res[5]["check_ok"] is True, res[5]
+    assert not res[6]["ok"] and res[6]["check_ok"] is False, res[6]
+    assert res[6]["stage"] == "check", res[6]
+
+    # validate() turns sub-floor coverage into a failure...
+    ok, reason = execution_validator.validate(UNCALLED)
+    assert not ok and reason.startswith("low_coverage:"), (ok, reason)
+    # ...but exempts a pure class + register() answer.
+    ok, reason = execution_validator.validate(CLASS_REGISTER)
+    assert ok, (ok, reason)
+
+    good = "```python\nimport bpy\nbpy.ops.mesh.primitive_cube_add(size=2, align='CURSOR')\n```"
+    rows = [
+        {"question": "How do I add a cube?", "answer": good, "validated": True},
+        {"question": "How do I add a cube twice?", "answer": good,
+         "validated": "unverified"},
+        # legacy row without the key must still pass
+        {"question": "How do I add a cube three times?", "answer": good},
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "rows.jsonl"
+        with path.open("w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        kept = combine_data.load_clean("model_corrections", str(path))
+    questions = [r["question"] for r in kept]
+    assert "How do I add a cube?" in questions, questions
+    assert "How do I add a cube three times?" in questions, questions
+    assert "How do I add a cube twice?" not in questions, questions
+
+
+if shutil.which(config.BLENDER_BIN) is None:
+    print(f"SKIPPED execution checks: Blender not found ({config.BLENDER_BIN})")
+else:
+    check_execution()
+    print("EXECUTION CHECKS PASSED")
+
 print("ALL CHECKS PASSED")

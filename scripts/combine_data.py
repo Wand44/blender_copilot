@@ -57,6 +57,8 @@ CONFIG = {
     },
     "target_total": 10000,
     "output": str(config.TRAIN_FILE),
+    "val": str(config.VAL_FILE),
+    "preferences": str(config.PREFERENCE_FILE),
 }
 
 random.seed(SEED)
@@ -104,9 +106,13 @@ def load_clean(source: str, path: str, whole: bool = False) -> List[Dict]:
             if str(r.get("type")) == "6":
                 reasons["masked_completion"] += 1
                 continue
-            # pipeline rows carry their Blender check result; never train on
-            # a known-failing answer even if it happens to pass static checks
-            if r.get("validated") is False:
+            # Generated rows must be explicitly verified; legacy rows without
+            # a "validated" key are still allowed through.
+            validated = r.get("validated")
+            if validated is False or (
+                    "validated" in r
+                    and source in ("model_corrections", "synthetic")
+                    and validated is not True):
                 reasons["marked_invalid"] += 1
                 continue
             a = validator.normalize_answer(a)
@@ -130,6 +136,11 @@ def load_clean(source: str, path: str, whole: bool = False) -> List[Dict]:
                 "_type": row_type,
                 "_source": source,
                 "_whole": whole,
+                "_seed_ids": r.get("seed_ids") or [],
+                "_small_ok": r.get("small_ok"),
+                "_small_answer": r.get("small_answer"),
+                "_small_error": r.get("small_error"),
+                "_validated": r.get("validated"),
             })
     print(f"[{source}] {len(kept)} valid / {sum(reasons.values())} rejected "
           f"-> types {dict(types.most_common())}; top rejects: {dict(reasons.most_common(3))}")
@@ -185,6 +196,52 @@ def cap_types(rows: List[Dict]) -> List[Dict]:
     return final
 
 
+def split_validation(rows: List[Dict], ratio: float = 0.03):
+    """Hold out rows before dedup/cap, keeping each seed group together."""
+    groups = {}
+    for i, r in enumerate(rows):
+        seeds = r.get("_seed_ids") or []
+        key = tuple(seeds) if seeds else ("row", i)
+        groups.setdefault(key, []).append(r)
+    keys = list(groups)
+    random.shuffle(keys)
+    target = max(1, int(len(rows) * ratio)) if rows else 0
+    val = []
+    for key in keys:
+        if len(val) >= target:
+            break
+        val.extend(groups[key])
+    val_ids = {id(r) for r in val}
+    return [r for r in rows if id(r) not in val_ids], val
+
+
+def write_qa(path: str, rows: List[Dict]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            # final schema is exactly question + answer
+            f.write(json.dumps({"question": r["question"],
+                                "answer": r["answer"]},
+                               ensure_ascii=False) + "\n")
+
+
+def write_preferences(path: str, rows: List[Dict]) -> None:
+    prefs = [{"prompt": r["question"], "chosen": r["answer"],
+              "rejected": r["_small_answer"], "small_error": r["_small_error"]}
+             for r in rows
+             if r.get("_source") == "model_corrections"
+             and r.get("_small_ok") is False
+             and r.get("_validated") is True
+             and r.get("_small_answer")]
+    if not prefs:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for p in prefs:
+            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+    print(f"[out] {path} ({len(prefs)} rows)")
+
+
 def main():
     validator.load_cache()
     all_rows = []
@@ -209,27 +266,32 @@ def main():
                       f"sampled {fill}/{len(fill_rows)} docs (ratio {ratio})")
                 fill_rows = fill_rows[:fill]
         valid = keep_rows + fill_rows
+        for r in valid:
+            r["_group"] = name
         print(f"[{name}] {len(valid)} rows")
         all_rows.extend(valid)
 
     if not all_rows:
         sys.exit("No valid data from any source, aborting.")
-    rows = dedup(all_rows)
+
+    # Split is reserved before dedup/cap so validation rows are untouched.
+    core = [r for r in all_rows if r.get("_group") == "blender_core"]
+    rest = [r for r in all_rows if r.get("_group") != "blender_core"]
+    core_train, val_rows = split_validation(core)
+    print(f"[val] {len(val_rows)} rows held out from blender_core")
+    write_preferences(CONFIG["preferences"], core)
+
+    rows = dedup(core_train + rest)
     # Small sources and generated keep rows are never ratio-sampled or
     # per-type-capped; everything else goes through the cap.
     exempt = [r for r in rows if r.get("_whole") or r.get("_keep")]
     rows = cap_types([r for r in rows if not (r.get("_whole") or r.get("_keep"))]) + exempt
     random.shuffle(rows)
 
-    out = CONFIG["output"]
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    with open(out, "w", encoding="utf-8") as f:
-        for r in rows:
-            # final schema is exactly question + answer
-            f.write(json.dumps({"question": r["question"],
-                                "answer": r["answer"]},
-                               ensure_ascii=False) + "\n")
-    print(f"[out] {out} ({len(rows)} rows)")
+    write_qa(CONFIG["output"], rows)
+    print(f"[out] {CONFIG['output']} ({len(rows)} rows)")
+    write_qa(CONFIG["val"], val_rows)
+    print(f"[out] {CONFIG['val']} ({len(val_rows)} rows)")
 
     print("      per type:",
           dict(Counter(r.get("_type", "?") for r in rows).most_common()))

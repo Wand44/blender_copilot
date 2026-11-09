@@ -20,11 +20,6 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Dict, List, Any, Optional
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-except ImportError:  # system python may lack the venv's python-dotenv
-    pass
 import validator
 import execution_validator
 import config
