@@ -45,6 +45,8 @@ OUTPUT = config.MODEL_CORRECTIONS_FILE
 
 SMALL_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "qwen3.5:4b")
+# First run + one retry run; rows still failing after that are dropped.
+MAX_ATTEMPTS = 3
 SMALL_SYSTEM = (
     "You are a Blender 5.x Python coding assistant. Answer with a short explanation "
     "followed by exactly one ```python code block and nothing after it. The code must "
@@ -156,6 +158,11 @@ def save_row(path: Path, question: str, row: dict) -> None:
     else:
         rows.append(row)
     write_jsonl(path, rows)
+
+
+def remove_row(path: Path, question: str) -> None:
+    write_jsonl(path, [r for r in read_jsonl(path)
+                       if r.get("question") != question])
 
 
 def purge(path: Path = OUTPUT) -> None:
@@ -396,12 +403,13 @@ def correct(question: str, small_answer: str, reason: str,
     return None, "", info
 
 
-def process(item: dict, status) -> tuple:
+def process(item: dict, status, small_answer: str = None) -> tuple:
     """Answer, validate, and (if needed) fix one question. Saves the row."""
     question = item["question"]
     reference_check = item.get("reference_check") or item.get("check") or ""
-    status("asking small model")
-    small_answer = ask_small(question)
+    if small_answer is None:
+        status("asking small model")
+        small_answer = ask_small(question)
     status("checking question + code")
     ok, reason, info = evaluate(question, small_answer, reference_check,
                                 require_check=bool(reference_check))
@@ -435,6 +443,7 @@ def process(item: dict, status) -> tuple:
         "task_type": config.task_type(4),
         "source": "model_corrections",
         "difficulty": item.get("difficulty", ""),
+        "attempts": int(item.get("attempts") or 0) + 1,
         "seed_ids": item.get("seed_ids", []),
         "small_model": SMALL_MODEL,
         "small_answer": small_answer,
@@ -480,34 +489,49 @@ def main():
     output = read_jsonl(OUTPUT)
     known = {row.get("question") for row in output}
     # A row without an answer is an unfinished question: answer it this run.
+    # A row without an answer is an unfinished question: answer it this run.
     pending = [row for row in output if row.get("question") and not row.get("answer")]
+    # Failed rows get one more run (re-check stored answer + 2 rewrites).
+    retry = [row for row in output
+             if row.get("validated") is False
+             and int(row.get("attempts") or 0) < MAX_ATTEMPTS]
 
     new_count = max(0, args.questions - len(pending))
-    total = len(pending) + new_count
+    total = len(pending) + len(retry) + new_count
     if not total:
         print("Nothing to do (seed or question supply exhausted).")
         return
 
-    counts = {"passed": 0, "corrected": 0, "rejected": 0}
+    counts = {"passed": 0, "corrected": 0, "rejected": 0, "dropped": 0}
     misses = 0
     with tqdm(total=total, desc="questions", unit="q", dynamic_ncols=True,
               file=sys.stdout) as bar:
         n = 0
 
-        def run(item):
+        def run(item, small_answer=None):
             nonlocal n
             n += 1
             bar.set_description(f"Q{n:02d}")
-            tqdm.write(f"{c(f'Q{n:02d}', '36')} "
-                       f"{c(item.get('difficulty') or 'resume', '35')}  "
+            tag = item.get("difficulty") or "resume"
+            if item.get("attempts"):
+                tag += " retry"
+            tqdm.write(f"{c(f'Q{n:02d}', '36')} {c(tag, '35')}  "
                        f"{item['question'][:96]}")
-            row, key = process(item, bar.set_postfix_str)
+            row, key = process(item, bar.set_postfix_str, small_answer)
             counts[key] += 1
             status_line(n, total, key, row)
+            if key == "rejected" and row.get("attempts", 0) >= MAX_ATTEMPTS:
+                remove_row(OUTPUT, item["question"])
+                known.discard(item["question"])
+                counts["dropped"] += 1
+                tqdm.write(c(f"  ⌫ Q{n:02d} dropped after "
+                             f"{MAX_ATTEMPTS} attempts", "31"))
             bar.update(1)
 
         for item in pending:
             run(item)
+        for item in retry:
+            run(item, item.get("small_answer") or item.get("answer") or None)
 
         made = 0
         while made < new_count:
