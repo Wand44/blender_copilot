@@ -10,12 +10,13 @@ The cache is the single source of truth for the synthetic-data pipeline:
     - context / data / props / utils / app roots
     - extra modules: bmesh, mathutils, bpy_extras, gpu, aud, freestyle, idprop, imbuf
     - namespace tags for diversity capping
-    - a small deprecated/removed table for the 4.x line
+    - a small deprecated/removed table for the 5.x line
 """
 import json
+import os
 import sys
 import bpy
-import blender_config
+import config
 
 
 def enum_values(cls, prop):
@@ -132,8 +133,8 @@ def collect_modules():
 
 
 def collect_deprecated():
-    """Known 4.x renames/removals. Keys are dotted attribute chains; values are
-    the preferred replacement or None if fully removed."""
+    """Known renames/removals in the 4.x/5.x line. Keys are dotted attribute
+    chains; values are the preferred replacement or None if fully removed."""
     return {
         "bgl": None,
         "bpy.types.Mesh.use_auto_smooth": None,
@@ -158,7 +159,8 @@ def collect_deprecated():
 
 
 def main():
-    out = sys.argv[-1] if sys.argv[-1].endswith(".json") else "/tmp/opencode/bpy_api_cache.json"
+    out = sys.argv[-1] if sys.argv[-1].endswith(".json") else str(config.CACHE_PATH)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
     print("CACHE building...", bpy.app.version_string)
     types, type_ns = collect_types()
@@ -181,8 +183,8 @@ def main():
     dump = {
         "blender_version": bpy.app.version_string,
         "blender_version_tuple": bpy.app.version,
-        "target_version": blender_config.TARGET_BLENDER,
-        "blender_bin": blender_config.BLENDER_BIN,
+        "target_version": config.TARGET_BLENDER,
+        "blender_bin": config.BLENDER_BIN,
         "types": types,
         "ops": ops,
         "ops_props": ops_props,

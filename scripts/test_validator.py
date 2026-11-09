@@ -68,16 +68,22 @@ assert validator.fim_full_code(fim_q, fim_a) == (
     "import bpy\nobj = bpy.context.object\nobj.location.x = 1")
 assert validator.fim_full_code("<|fim_prefix|>import bpy\n", fim_a) is None
 
-# 13. legacy two-section headings are stripped by the cleaner
-import clean_existing
+# 13. legacy two-section headings are stripped when merging old rows
 legacy = ("1) Architecture Overview\n\nProse.\n\n2) The Code\n"
           "```python\nimport bpy\n```")
-assert clean_existing.normalize_answer(legacy) == (
+assert validator.normalize_answer(legacy) == (
     "Prose.\n\n```python\nimport bpy\n```")
 
-# 14. type-4 pipeline parses the big model's ===ANSWER=== wrapper
-import pipeline_type4
-assert pipeline_type4.parse_answer("noise\n===ANSWER===\nfinal") == "final"
-assert pipeline_type4.parse_answer("```python\nx = 1\n```") == "```python\nx = 1\n```"
+# 14. one taxonomy: generator ints and task names normalize the same way
+import config
+assert config.task_type(4) == "explanation"
+assert config.task_type(7) == "bugfix"
+assert config.task_type("fim") == "fim"
+assert config.task_type(99) == "explanation"
+
+# 15. type-4 pipeline parses the big model's ===ANSWER=== wrapper
+import model_correction
+assert model_correction.parse_answer("noise\n===ANSWER===\nfinal") == "final"
+assert model_correction.parse_answer("```python\nx = 1\n```") == "```python\nx = 1\n```"
 
 print("ALL CHECKS PASSED")

@@ -6,10 +6,10 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from bs4 import BeautifulSoup
-import blender_config
+import config
 
-DOC_DIR = blender_config.DOC_DIR_DEFAULT
-OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "../data/doc_data.jsonl")
+DOC_DIR = str(config.DOC_DIR_DEFAULT)
+OUTPUT_FILE = str(config.DOC_FILE)
 MAX_PARALLEL_WORKERS = min(16, os.cpu_count() or 4)
 
 
