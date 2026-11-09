@@ -86,4 +86,15 @@ import model_correction
 assert model_correction.parse_answer("noise\n===ANSWER===\nfinal") == "final"
 assert model_correction.parse_answer("```python\nx = 1\n```") == "```python\nx = 1\n```"
 
+# 16. questions are saved first; answering fills the same row instead of appending
+import tempfile
+from pathlib import Path
+with tempfile.TemporaryDirectory() as d:
+    path = Path(d) / "corrections.jsonl"
+    model_correction.append_jsonl(path, {"question": "q1"})
+    model_correction.save_row(path, "q1", {"question": "q1", "answer": "a1"})
+    rows = model_correction.read_jsonl(path)
+    assert len(rows) == 1 and rows[0]["answer"] == "a1", rows
+    assert not [r for r in rows if not r.get("answer")]
+
 print("ALL CHECKS PASSED")

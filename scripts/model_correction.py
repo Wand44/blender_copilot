@@ -12,7 +12,8 @@
 
 Everything lands in one file, data/generated/model_corrections.jsonl, which
 combine_data.py cleans and merges into data/final/train.jsonl.
-Resume skips questions already recorded there.
+Questions are written as soon as they are generated; resume answers any row
+that has no answer yet.
 
 Usage:
     python3 scripts/model_correction.py --questions 20
@@ -86,6 +87,23 @@ def append_jsonl(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def save_row(path: Path, question: str, row: dict) -> None:
+    """Replace the question's placeholder row (or append if it is missing)."""
+    # shortcut: rewrites the whole file per answer; fine for thousands of rows.
+    rows = read_jsonl(path)
+    for i, r in enumerate(rows):
+        if r.get("question") == question:
+            rows[i] = row
+            break
+    else:
+        rows.append(row)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    tmp.replace(path)
 
 
 def build_questions(count: int, seeds, buckets, known: set, workers: int):
@@ -206,16 +224,32 @@ def main():
         buckets.setdefault(big.topic_key(s), []).append(i)
 
     output = read_jsonl(OUTPUT)
-    done = {row.get("question") for row in output}
+    known = {row.get("question") for row in output}
+    # A row without an answer is an unfinished question: answer it this run.
+    pending = [row for row in output if row.get("question") and not row.get("answer")]
 
-    print(f"Asking the big LLM for {args.questions} new question(s)...")
-    # shortcut: questions stay in memory until their row is written, so a crash
-    # loses that batch's big-model calls; add a question cache if that hurts.
-    pending = build_questions(args.questions, seeds, buckets, done, args.workers)
-    print(f"Generated {len(pending)} question(s).")
+    new_count = max(0, args.questions - len(pending))
+    if new_count:
+        print(f"Asking the big LLM for {new_count} new question(s)...")
+        fresh = build_questions(new_count, seeds, buckets, known, args.workers)
+        print(f"Generated {len(fresh)} question(s).")
+        # Persist questions before answering them, so a crash loses no work and
+        # the next run can pick them up from the file.
+        for item in fresh:
+            append_jsonl(OUTPUT, {
+                "question": item["question"],
+                "reference": item.get("reference", ""),
+                "type": "4",
+                "task_type": config.task_type(4),
+                "source": "model_corrections",
+                "seed_ids": item.get("seed_ids", []),
+            })
+        pending.extend(fresh)
+
     if not pending:
         print("Nothing new to process (seed or question supply exhausted).")
         return
+    print(f"Processing {len(pending)} question(s).")
 
     counts = {"passed": 0, "corrected": 0, "rejected": 0}
     for n, item in enumerate(pending, 1):
@@ -245,7 +279,7 @@ def main():
             "corrected": corrected,
             "validated": accepted,
         }
-        append_jsonl(OUTPUT, row)
+        save_row(OUTPUT, question, row)
 
         key = "passed" if ok else ("corrected" if corrected else "rejected")
         counts[key] += 1

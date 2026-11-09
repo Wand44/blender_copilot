@@ -53,7 +53,8 @@ All paths, the target Blender version, and task types live in `scripts/config.py
    - If it fails, the big LLM rewrites the correct answer with the failure fed back;
      the big model's reference answer is tried first, so a valid one costs no extra call.
    - Output: `data/generated/model_corrections.jsonl` — question, small-model answer,
-     final answer, failure reason, and `validated`. Resume skips recorded questions.
+     final answer, failure reason, and `validated`. Each question is written as soon
+     as it is generated; a run resumes any row that still has no answer.
 
 5. **Combine sources** — `python3 scripts/combine_data.py`
    - Cleaning happens here before anything is merged, so every source is already
