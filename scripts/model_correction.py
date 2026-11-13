@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """Type-4 data pipeline: big LLM -> small model -> headless Blender -> big LLM fix.
 
@@ -28,10 +29,10 @@ import random
 import re
 import shutil
 import sys
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-
-from tqdm import tqdm
 
 import requests
 
@@ -42,6 +43,11 @@ import config
 
 SEEDS = config.DOC_FILE
 OUTPUT = config.MODEL_CORRECTIONS_FILE
+
+# Worker threads save rows concurrently; every file write goes through this lock.
+_FILE_LOCK = threading.Lock()
+# The small model is served one request at a time; big-model calls run in parallel.
+_SMALL_LOCK = threading.Lock()
 
 SMALL_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "qwen3.5:4b")
@@ -73,7 +79,13 @@ any scene state it needs, calls the answer's function(s) with sample arguments, 
 asserts read-back values (modifier type, property values, object count).
 
 The code must run standalone in a fresh headless Blender scene (an active default cube
-exists) and use only real Blender 5.x Python APIs. Do not reuse the failed code."""
+exists) and use only real Blender 5.x Python APIs. Do not reuse the failed code.
+Requirements: if the question asks for a function, the answer must be functions with
+explicit arguments (objects passed in) and no hardcoded scene lookups; the check must
+call the answer's functions or inspect results, never reset the scene, and derive from
+what the question asks. For class/register answers, the check must invoke the behaviour
+(e.g. bpy.ops call) and assert results, not just registration. No invented properties;
+hasattr guards to dodge missing APIs are not allowed."""
 
 GEN_FORMAT = (
     "Respond in EXACTLY this delimiter format, no JSON, no prose outside the requested sections:\n"
@@ -84,7 +96,23 @@ GEN_FORMAT = (
     "and end there. The check must be plain Python (no fences, no prose) that runs after the "
     "answer in the same namespace: create any scene state it needs, call the answer's "
     "function(s) with sample arguments, and assert read-back values (modifier type, property "
-    "values, object count). Keep it short."
+    "values, object count). Keep it short.\n"
+    "Requirements for function questions: the question must name the function and its "
+    "signature when it asks for a function (e.g. \"Write `get_camera_names() -> list[str]` that ...\"). "
+    "The answer must be functions with explicit arguments (objects/trees passed in) and no "
+    "hardcoded scene lookups such as bpy.data.objects['Cube']. For simple beginner one-liners "
+    "that are scripts, the check must inspect the state the script left behind, without deleting "
+    "or resetting the scene.\n"
+    "The check must call the answer's functions or inspect their results; it must never "
+    "reimplement the task itself, never reset or clear the scene first, and must be derived "
+    "from what the question asks (return type, names, values), not from what the answer happens "
+    "to do. The check may only use object/data names the question or the answer's code creates.\n"
+    "The headless harness has no camera and exactly one default cube named \"Cube\". "
+    "For class/register answers (operators, panels, render engines), the check must invoke "
+    "the class behaviour (e.g. the bpy.ops call for an operator, or instantiate and call its "
+    "methods) and assert results, not just assert registration.\n"
+    "Every attribute used in the answer must exist in Blender 5.x; guarding with hasattr to "
+    "dodge a missing API is not allowed."
 )
 
 # Cycled per question so a run spans real-world difficulty, not just addons.
@@ -110,13 +138,75 @@ def c(text, code):
     return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
 
 
-def status_line(n, total, key, row):
-    icon, code = {"passed": ("✔", "32"), "corrected": ("✎", "33"),
-                  "rejected": ("✘", "31")}[key]
-    detail = "" if key == "passed" else f"  {row.get('small_error') or ''}"
-    tqdm.write(f"  {c(icon, code)} {c(f'Q{n:02d}/{total}', '36')} "
-               f"{c(row.get('difficulty') or '?', '35')}  "
-               f"{c(key, code)}{detail[:80]}")
+class LiveStatus:
+    """In-flight questions, redrawn in place on a TTY (plain lines otherwise)."""
+
+    ICONS = {"passed": ("✔", "32"), "corrected": ("✎", "33"),
+             "rejected": ("✘", "31")}
+
+    def __init__(self, total):
+        self.total = total
+        self.done = 0
+        self.counts = {"passed": 0, "corrected": 0, "rejected": 0, "dropped": 0}
+        self.active = {}      # jid -> (stage, question)
+        self.recent = []      # last few results, so failures stay visible
+        self.lock = threading.Lock()
+        self.drawn = 0
+        self.tty = sys.stdout.isatty()
+
+    def stage(self, jid, msg, question):
+        line = question.replace("\n", " ")
+        with self.lock:
+            self.active[jid] = (msg, line)
+            if self.tty:
+                self._draw()
+            else:
+                print(f"  Q{jid:02d} {msg:<22} {line[:80]}")
+
+    def finish(self, jid, key, row):
+        with self.lock:
+            self.active.pop(jid, None)
+            self.done += 1
+            self.counts[key] += 1
+            icon, code = self.ICONS[key]
+            detail = "" if key == "passed" else "  " + (
+                row.get("small_error") or row.get("correction_error") or "")
+            line = f"{c(icon, code)} {c(f'Q{jid:02d}', '36')} {c(key, code)}{detail[:72]}"
+            self.recent = (self.recent + [line])[-3:]
+            if self.tty:
+                self._draw()
+            else:
+                print("  " + line)
+
+    def drop(self, jid):
+        with self.lock:
+            self.counts["dropped"] += 1
+            tag = f"Q{jid:02d}"
+            self.recent = [r for r in self.recent if tag not in r]
+            self.recent = (self.recent + [c(f"⌫ {tag} dropped", "31")])[-3:]
+            if self.tty:
+                self._draw()
+
+    def _draw(self):
+        n = self.counts
+        lines = [f"  {c(f'{self.done}/{self.total} done', '1')}   "
+                 f"{c('✔' + str(n['passed']), '32')} "
+                 f"{c('✎' + str(n['corrected']), '33')} "
+                 f"{c('✘' + str(n['rejected']), '31')}   "
+                 f"{len(self.active)} active"]
+        lines += ["  " + r for r in self.recent]
+        lines.append("")
+        for jid, (msg, question) in sorted(self.active.items()):
+            lines.append(f"  {c(f'Q{jid:02d}', '36')} {c(f'{msg:<22}', '35')} "
+                         f"{question[:72]}")
+        out = sys.stdout
+        if self.drawn:
+            out.write(f"\x1b[{self.drawn}A")
+        width = max(self.drawn, len(lines))
+        for i in range(width):
+            out.write("\x1b[2K" + (lines[i] if i < len(lines) else "") + "\n")
+        self.drawn = width
+        out.flush()
 
 
 def read_jsonl(path: Path):
@@ -135,7 +225,7 @@ def read_jsonl(path: Path):
 
 def append_jsonl(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
+    with _FILE_LOCK, path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
@@ -150,19 +240,21 @@ def write_jsonl(path: Path, rows) -> None:
 def save_row(path: Path, question: str, row: dict) -> None:
     """Replace the question's placeholder row (or append if it is missing)."""
     # shortcut: rewrites the whole file per answer; fine for thousands of rows.
-    rows = read_jsonl(path)
-    for i, r in enumerate(rows):
-        if r.get("question") == question:
-            rows[i] = row
-            break
-    else:
-        rows.append(row)
-    write_jsonl(path, rows)
+    with _FILE_LOCK:
+        rows = read_jsonl(path)
+        for i, r in enumerate(rows):
+            if r.get("question") == question:
+                rows[i] = row
+                break
+        else:
+            rows.append(row)
+        write_jsonl(path, rows)
 
 
 def remove_row(path: Path, question: str) -> None:
-    write_jsonl(path, [r for r in read_jsonl(path)
-                       if r.get("question") != question])
+    with _FILE_LOCK:
+        write_jsonl(path, [r for r in read_jsonl(path)
+                           if r.get("question") != question])
 
 
 def purge(path: Path = OUTPUT) -> None:
@@ -195,7 +287,7 @@ def purge(path: Path = OUTPUT) -> None:
 
 
 def revalidate(path: Path = OUTPUT) -> None:
-    """Re-run coverage validation over old rows (empty check) and update them."""
+    """Re-run execution validation over old rows (empty check) and update them."""
     validator.load_cache()
     if not path.exists():
         raise SystemExit(f"No file to revalidate: {path}")
@@ -206,35 +298,50 @@ def revalidate(path: Path = OUTPUT) -> None:
         blocks = validator.extract_fences(r.get("answer") or "")
         codes.append(blocks[0] if blocks else "")
 
-    job_rows = [i for i, code in enumerate(codes) if code.strip()]
-    results = execution_validator.run_batch([codes[i] for i in job_rows]) \
-        if job_rows else []
-    result_by_row = dict(zip(job_rows, results))
-
     passed = 0
     reasons = Counter()
+    vacuous_checked = 0
+    cot_checked = 0
+    vacuous_fail = 0
+    cot_fail = 0
     for i, r in enumerate(rows):
-        res = result_by_row.get(i)
-        if res is None:
-            ok, reason, coverage, nonfatal = False, "no_code_block", 0.0, False
-        else:
-            coverage = float(res.get("coverage") or 0.0)
-            class_reg = execution_validator.is_class_register(codes[i])
-            nonfatal = bool(res.get("nonfatal"))
-            if not res.get("ok"):
-                if res.get("stage") == "check":
-                    reason = "check_failed"
-                else:
-                    reason = "exec_" + str(res.get("error_type", "ExecutionError")).lower()
-                ok = False
-            elif coverage < execution_validator.COVERAGE_FLOOR and not class_reg:
-                ok, reason = False, f"low_coverage:{int(round(coverage * 100))}"
+        check = r.get("check") or ""
+        code = codes[i]
+        res = execution_validator.run_with_check(code, check) if check.strip() \
+            else execution_validator.run_code(code)
+        coverage = float(res.get("coverage") or 0.0)
+        class_reg = execution_validator.is_class_register(code)
+        nonfatal = bool(res.get("nonfatal"))
+        ok = bool(res.get("ok"))
+        reason = "ok"
+        if not ok:
+            ok = False
+            if res.get("stage") == "check":
+                reason = "check_failed"
             else:
-                ok, reason = True, "ok"
+                reason = "exec_" + str(res.get("error_type", "ExecutionError")).lower()
+        elif check.strip():
+            vacuous_checked += 1
+            if execution_validator.is_vacuous_check(check):
+                ok, reason = False, "vacuous_check"
+        elif class_reg or coverage < execution_validator.COVERAGE_FLOOR:
+            ok, reason = False, "unverified"
+        if check.strip() and ok:
+            cot_checked += 1
+            prose = (r.get("answer") or "").split("```", 1)[0]
+            if any(m in prose.lower() for m in validator.COT_MARKERS):
+                ok, reason = False, "chain_of_thought"
+        if ok and not class_reg and coverage < execution_validator.COVERAGE_FLOOR:
+            ok, reason = False, f"low_coverage:{int(round(coverage * 100))}"
+
         if ok:
             passed += 1
         else:
             reasons[reason] += 1
+            if reason == "vacuous_check":
+                vacuous_fail += 1
+            if reason == "chain_of_thought":
+                cot_fail += 1
         r["validated"] = ok
         r["coverage"] = round(coverage, 3)
         r["exec_nonfatal"] = nonfatal
@@ -243,6 +350,8 @@ def revalidate(path: Path = OUTPUT) -> None:
     write_jsonl(path, rows)
     print(f"Revalidated {len(rows)} rows: {passed} pass, {len(rows) - passed} fail")
     print("Top failures:", dict(reasons.most_common(5)))
+    print(f"vacuous_check: {vacuous_checked} checked, {vacuous_fail} failed")
+    print(f"COT prose: {cot_checked} checked, {cot_fail} failed")
 
 
 def build_question(seeds, buckets, known, difficulty):
@@ -279,6 +388,11 @@ def build_question(seeds, buckets, known, difficulty):
                                           strict_format=True)
         if not ok or q in known:
             continue
+        # The reference must pass its own check: otherwise no answer ever can,
+        # and every correction call on this question is wasted.
+        ok, _, _ = evaluate(q, res["reference"], check, require_check=True)
+        if not ok:
+            continue
         return {"question": q, "reference": res["reference"],
                 "reference_check": check, "seed_ids": [i] + chosen,
                 "difficulty": label}
@@ -298,11 +412,15 @@ def ask_small(question: str) -> str:
     }
     for _ in range(3):
         try:
-            r = requests.post(SMALL_URL, json=payload, timeout=900)
-            r.raise_for_status()
-            return (r.json().get("message", {}).get("content") or "").strip()
-        except Exception as e:  # transient Ollama load/connection errors
-            print(f"  small model error: {e}")
+            # Ollama serves one request at a time: keep small calls serial.
+            with _SMALL_LOCK:
+                r = requests.post(SMALL_URL, json=payload, timeout=900)
+                r.raise_for_status()
+                return (r.json().get("message", {}).get("content") or "").strip()
+        except Exception:  # transient Ollama load/connection errors
+            # No console output here: the live panel owns the terminal. A broken
+            # Ollama call surfaces as a no_code_block rejection instead.
+            pass
     return ""
 
 
@@ -329,20 +447,24 @@ def evaluate(question: str, answer: str, check: str = "",
     })
     class_reg = execution_validator.is_class_register(code)
     if not res.get("code_ok"):
-        if res.get("stage") == "check":
-            return False, "check_failed:" + (res.get("check_error") or "")[:60], info
         if res.get("nonfatal"):
             return False, f"nonfatal:{res.get('error_type', 'RuntimeError')}", info
         reason = res.get("error") or "execution failed"
         return False, f"exec_{str(res.get('error_type', 'ExecutionError')).lower()}:{reason[:60]}", info
-    if not class_reg and info["coverage"] < execution_validator.COVERAGE_FLOOR:
-        return False, f"low_coverage:{int(round(info['coverage'] * 100))}", info
-    if require_check and not class_reg:
+    # The check comes before coverage: a broken check is the actionable reason,
+    # and low coverage would otherwise hide it from the correction prompt.
+    if require_check:
         if not check:
             info["unverified"] = True
             return False, "missing_check", info
         if res.get("check_ok") is not True:
-            return False, "check_failed", info
+            detail = (res.get("check_error") or res.get("error") or "")[:120]
+            return False, f"check_failed:{detail}", info
+    if not class_reg and info["coverage"] < execution_validator.COVERAGE_FLOOR:
+        return False, f"low_coverage:{int(round(info['coverage'] * 100))}", info
+    # Vacuous check: does the check also pass when no answer code ran at all?
+    if check and res.get("check_ok") is True and execution_validator.is_vacuous_check(check):
+        return False, "vacuous_check", info
     return True, "ok", info
 
 
@@ -400,6 +522,7 @@ def correct(question: str, small_answer: str, reason: str,
         if ok:
             return candidate, check, info
         attempt, why = candidate, r
+    info["correction_error"] = why
     return None, "", info
 
 
@@ -416,6 +539,19 @@ def process(item: dict, status, small_answer: str = None) -> tuple:
 
     final, final_check = small_answer, reference_check if ok else ""
     corrected = False
+    answer_source = "small"
+    if ok and item.get("reference"):
+        prose = small_answer.split("```", 1)[0]
+        bad_prose = len(prose) > 600 or any(m in prose.lower() for m in validator.COT_MARKERS)
+        if bad_prose:
+            ref_ok, _, ref_info = evaluate(question, item.get("reference") or "",
+                                          item.get("reference_check") or "",
+                                          require_check=True)
+            if ref_ok:
+                final, final_check = item.get("reference") or small_answer, \
+                    item.get("reference_check") or ""
+                info = ref_info
+                answer_source = "reference"
     if not ok:
         status("fixing with big model")
         result, check, cinfo = correct(question, small_answer, reason,
@@ -425,6 +561,9 @@ def process(item: dict, status, small_answer: str = None) -> tuple:
             final, final_check = result, check
             info = cinfo
             corrected = True
+            answer_source = "reference"
+        else:
+            info["correction_error"] = cinfo.get("correction_error")
 
     if ok or corrected:
         validated = True
@@ -437,15 +576,17 @@ def process(item: dict, status, small_answer: str = None) -> tuple:
         "question": question,
         "answer": final,
         "check": final_check,
+        # Kept so a retry can still try the big model's reference answer first.
+        "reference": item.get("reference", ""),
+        "reference_check": reference_check,
+        "correction_error": info.get("correction_error"),
         "coverage": round(float(info.get("coverage", 0.0)), 3),
         "exec_nonfatal": bool(info.get("exec_nonfatal")),
-        "type": "4",
-        "task_type": config.task_type(4),
         "source": "model_corrections",
         "difficulty": item.get("difficulty", ""),
+        "answer_source": answer_source,
         "attempts": int(item.get("attempts") or 0) + 1,
         "seed_ids": item.get("seed_ids", []),
-        "small_model": SMALL_MODEL,
         "small_answer": small_answer,
         "small_ok": ok,
         "small_error": None if ok else reason,
@@ -460,6 +601,8 @@ def main():
     parser = argparse.ArgumentParser(description="Type-4 big->small->Blender->big pipeline")
     parser.add_argument("--questions", type=int, default=10,
                         help="number of new questions to generate/process this run")
+    parser.add_argument("--workers", type=int, default=10,
+                        help="questions processed concurrently")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--purge", action="store_true",
                         help="drop leaked/duplicate rows and tag the rest unverified")
@@ -489,11 +632,10 @@ def main():
     output = read_jsonl(OUTPUT)
     known = {row.get("question") for row in output}
     # A row without an answer is an unfinished question: answer it this run.
-    # A row without an answer is an unfinished question: answer it this run.
     pending = [row for row in output if row.get("question") and not row.get("answer")]
-    # Failed rows get one more run (re-check stored answer + 2 rewrites).
+    # Failed / unverified rows get one more run (re-check stored answer + 2 rewrites).
     retry = [row for row in output
-             if row.get("validated") is False
+             if (row.get("validated") is False or row.get("validated") == "unverified")
              and int(row.get("attempts") or 0) < MAX_ATTEMPTS]
 
     new_count = max(0, args.questions - len(pending))
@@ -502,49 +644,26 @@ def main():
         print("Nothing to do (seed or question supply exhausted).")
         return
 
-    counts = {"passed": 0, "corrected": 0, "rejected": 0, "dropped": 0}
-    misses = 0
-    with tqdm(total=total, desc="questions", unit="q", dynamic_ncols=True,
-              file=sys.stdout) as bar:
-        n = 0
+    panel = LiveStatus(total)
+    def status(jid, msg, question):
+        panel.stage(jid, msg, question)
 
-        def run(item, small_answer=None):
-            nonlocal n
-            n += 1
-            bar.set_description(f"Q{n:02d}")
-            tag = item.get("difficulty") or "resume"
-            if item.get("attempts"):
-                tag += " retry"
-            tqdm.write(f"{c(f'Q{n:02d}', '36')} {c(tag, '35')}  "
-                       f"{item['question'][:96]}")
-            row, key = process(item, bar.set_postfix_str, small_answer)
-            counts[key] += 1
-            status_line(n, total, key, row)
-            if key == "rejected" and row.get("attempts", 0) >= MAX_ATTEMPTS:
-                remove_row(OUTPUT, item["question"])
-                known.discard(item["question"])
-                counts["dropped"] += 1
-                tqdm.write(c(f"  ⌫ Q{n:02d} dropped after "
-                             f"{MAX_ATTEMPTS} attempts", "31"))
-            bar.update(1)
+    def answer(jid, item, small_answer=None):
+        """Answer, validate and save one question (worker thread)."""
+        q = item["question"]
+        return item, *process(item, lambda m: status(jid, m, q), small_answer)
 
-        for item in pending:
-            run(item)
-        for item in retry:
-            run(item, item.get("small_answer") or item.get("answer") or None)
-
-        made = 0
-        while made < new_count:
-            difficulty = DIFFICULTIES[made % len(DIFFICULTIES)]
-            bar.set_postfix_str(f"generating {difficulty[0]}")
+    def make(jid, difficulty):
+        """Generate one new question, then answer it (worker thread)."""
+        for _ in range(3):
+            status(jid, "generating question", f"({difficulty})")
             item = build_question(seeds, buckets, known, difficulty)
-            if item is None:
-                misses += 1
-                if misses >= 3:
-                    tqdm.write(c("no usable question from the big model; stopping", "31"))
-                    break
+            if not item:
                 continue
-            misses = 0
+            with _FILE_LOCK:
+                if item["question"] in known:
+                    continue
+                known.add(item["question"])
             # Persist the question before answering it, so a crash loses only
             # the question in flight and the next run resumes it.
             append_jsonl(OUTPUT, {
@@ -552,19 +671,42 @@ def main():
                 "reference": item.get("reference", ""),
                 "reference_check": item.get("reference_check", ""),
                 "check": "",
-                "type": "4",
-                "task_type": config.task_type(4),
                 "source": "model_corrections",
                 "difficulty": item.get("difficulty", ""),
                 "seed_ids": item.get("seed_ids", []),
             })
-            known.add(item["question"])
-            run(item)
-            made += 1
+            q = item["question"]
+            return item, *process(item, lambda m: status(jid, m, q), None)
+        return None, None, None
 
-    print(f"\n{c('Done', '1;32')}: {c(str(counts['passed']), '32')} passed, "
-          f"{c(str(counts['corrected']), '33')} corrected, "
-          f"{c(str(counts['rejected']), '31')} rejected -> {OUTPUT}")
+    jobs = [(answer, (item, None)) for item in pending]
+    jobs += [(answer, (item, item.get("small_answer") or item.get("answer") or None))
+             for item in retry]
+    jobs += [(make, (DIFFICULTIES[i % len(DIFFICULTIES)],))
+             for i in range(new_count)]
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = {pool.submit(fn, jid, *a): jid
+                   for jid, (fn, a) in enumerate(jobs, 1)}
+        for fut in as_completed(futures):
+            jid = futures[fut]
+            try:
+                item, row, key = fut.result()
+            except Exception as e:
+                panel.finish(jid, "rejected", {"small_error": str(e)[:80]})
+                continue
+            if item is None:
+                panel.finish(jid, "rejected", {"small_error": "no usable question"})
+                continue
+            panel.finish(jid, key, row)
+            if key == "rejected" and row.get("attempts", 0) >= MAX_ATTEMPTS:
+                remove_row(OUTPUT, item["question"])
+                known.discard(item["question"])
+                panel.drop(jid)
+
+    print(f"\n{c('Done', '1;32')}: {c(str(panel.counts['passed']), '32')} passed, "
+          f"{c(str(panel.counts['corrected']), '33')} corrected, "
+          f"{c(str(panel.counts['rejected']), '31')} rejected -> {OUTPUT}")
 
 
 if __name__ == "__main__":

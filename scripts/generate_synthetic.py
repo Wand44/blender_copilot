@@ -151,6 +151,13 @@ def _headers() -> Dict[str, str]:
 # ==============================================================================
 # LLM TRANSPORT (each retry rotates to the next model)
 # ==============================================================================
+def _content_text(content) -> str:
+    """Some providers return content as a list of parts instead of a string."""
+    if isinstance(content, list):
+        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return (content or "").strip()
+
+
 def call_llm(prompt: str, system_prompt: str) -> str:
     for attempt in range(CONFIG["max_llm_attempts"]):
         model = POOL.next()
@@ -180,7 +187,7 @@ def call_llm(prompt: str, system_prompt: str) -> str:
                 logger.warning(f"{model}: server error {status}, rotating")
                 continue
             response.raise_for_status()
-            text = response.json()["choices"][0]["message"]["content"].strip()
+            text = _content_text(response.json()["choices"][0]["message"]["content"])
             if not text:
                 POOL.bad(model)
                 continue

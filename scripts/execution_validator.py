@@ -23,7 +23,7 @@ import config
 BLENDER_BIN = config.BLENDER_BIN
 RUN_TIMEOUT = int(os.environ.get("BLENDER_EXEC_TIMEOUT", "120"))
 RESULT_START = "###EXEC_RESULT###"
-COVERAGE_FLOOR = 0.8
+COVERAGE_FLOOR = 0.9
 
 
 def _classify_error(ok: bool, msg: str, error_type: str) -> Dict:
@@ -281,6 +281,27 @@ def run_with_check(code: str, check: str) -> Dict:
     if not code.strip():
         return run_code(code)
     return run_batch([code], checks=[check])[0]
+
+
+def vacuous_checks(checks: List[str]) -> List[bool]:
+    """True where a check also passes with no answer code (it tests nothing).
+
+    All stubs run in one Blender process; checks that call answer-defined names
+    fail with NameError and are therefore not vacuous.
+    """
+    idx = [i for i, check in enumerate(checks) if check and check.strip()]
+    out = [False] * len(checks)
+    if not idx:
+        return out
+    results = run_batch(["import bpy"] * len(idx),
+                        checks=[checks[i] for i in idx])
+    for i, res in zip(idx, results):
+        out[i] = res.get("check_ok") is True
+    return out
+
+
+def is_vacuous_check(check: str) -> bool:
+    return bool(check and check.strip()) and vacuous_checks([check])[0]
 
 
 def validate(code: str, check: str = "") -> Tuple[bool, str]:

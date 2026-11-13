@@ -55,7 +55,7 @@ CONFIG = {
             "ratio": None,  # whole source
         },
     },
-    "target_total": 10000,
+    "target_total": 1000,
     "output": str(config.TRAIN_FILE),
     "val": str(config.VAL_FILE),
     "preferences": str(config.PREFERENCE_FILE),
