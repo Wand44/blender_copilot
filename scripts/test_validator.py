@@ -36,6 +36,10 @@ assert ok(r) and r[1] == "ok_reference", r
 cot = "Wait, let's look closer.\n\n```python\nimport bpy\n```"
 assert not ok(validator.validate_static("q", cot, "explanation"))
 
+# 6b. new COT markers rejected (case-insensitive), e.g. "Actually,"
+cot2 = "Actually, let me just do it.\n\n```python\nimport bpy\n```"
+assert not ok(validator.validate_static(q, cot2, "explanation"))
+
 # 7. non-string rejected
 assert not ok(validator.validate_static("q", ["list"], "explanation"))
 
@@ -86,6 +90,12 @@ import model_correction
 assert model_correction.parse_answer("noise\n===ANSWER===\nfinal") == "final"
 assert model_correction.parse_answer("```python\nx = 1\n```") == "```python\nx = 1\n```"
 
+# 15b. provider content parts are flattened, not .strip()'d (was a crash)
+import generate_synthetic as gs
+assert gs._content_text([{"type": "text", "text": "a"},
+                         {"type": "text", "text": " b "}]) == "a b"
+assert gs._content_text(" x ") == "x" and gs._content_text(None) == ""
+
 # 16. questions are saved first; answering fills the same row instead of appending
 import tempfile
 from pathlib import Path
@@ -96,6 +106,23 @@ with tempfile.TemporaryDirectory() as d:
     rows = model_correction.read_jsonl(path)
     assert len(rows) == 1 and rows[0]["answer"] == "a1", rows
     assert not [r for r in rows if not r.get("answer")]
+
+# 16b. concurrent workers don't lose rows (the file lock)
+import threading
+with tempfile.TemporaryDirectory() as d:
+    path = Path(d) / "concurrent.jsonl"
+    for i in range(20):
+        model_correction.append_jsonl(path, {"question": f"q{i}"})
+    threads = [threading.Thread(target=model_correction.save_row,
+                                args=(path, f"q{i}", {"question": f"q{i}", "answer": f"a{i}"}))
+               for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    rows = model_correction.read_jsonl(path)
+    assert len(rows) == 20, len(rows)
+    assert all(r["answer"] == "a" + r["question"][1:] for r in rows), rows
 
 # 17. execution validation needs real Blender: coverage, hidden checks, class +
 #     register exemption, and combine_data dropping "unverified" rows.
@@ -121,6 +148,7 @@ GUARDED = "import bpy\nobj = None\nif obj:\n    obj.name = 'x'\n"
 CALLED = "import bpy\ndef foo():\n    return 1\nfoo()\n"
 ATTR_ERROR = "import bpy\nbpy.context.object.does_not_exist = 1\n"
 EMPTY = "import bpy\n"
+CLASS_REGISTER_ANSWER = "```python\n" + CLASS_REGISTER + "```"
 
 
 def check_execution():
@@ -130,8 +158,8 @@ def check_execution():
     res = execution_validator.run_batch(codes, checks=checks)
     assert len(res) == len(codes), res
 
-    assert res[0]["code_ok"] and res[0]["coverage"] < 0.8, res[0]
-    assert res[1]["code_ok"] and res[1]["coverage"] < 0.8, res[1]
+    assert res[0]["code_ok"] and res[0]["coverage"] < execution_validator.COVERAGE_FLOOR, res[0]
+    assert res[1]["code_ok"] and res[1]["coverage"] < execution_validator.COVERAGE_FLOOR, res[1]
     assert res[2]["code_ok"] and res[2]["coverage"] == 1.0, res[2]
 
     assert not res[3]["ok"] and res[3]["error_type"] == "AttributeError", res[3]
@@ -148,6 +176,51 @@ def check_execution():
     # ...but exempts a pure class + register() answer.
     ok, reason = execution_validator.validate(CLASS_REGISTER)
     assert ok, (ok, reason)
+
+    # the harness has no camera, so a check asserting one must fail
+    cam = execution_validator.run_with_check(
+        "import bpy", "import bpy\nassert bpy.context.scene.camera is not None")
+    assert cam.get("check_ok") is False, cam
+
+    # vacuous check: passes with no answer code at all -> vacuous_check
+    vacuous_answer = "```python\nimport bpy\nbpy.ops.mesh.primitive_cube_add()\n```"
+    vacuous_check = "assert len(bpy.data.objects) >= 1"
+    okv, rev, _info = model_correction.evaluate("How do I add a cube?", vacuous_answer, vacuous_check)
+    assert not okv and rev == "vacuous_check", (okv, rev)
+
+    # check that calls the answer's function and asserts the result -> passes
+    fn_answer = "```python\ndef double(x):\n    return x * 2\n\ndouble(21)\n```"
+    fn_check = "assert double(21) == 42"
+    okf, reas, _info = model_correction.evaluate("Write a function that doubles.", fn_answer, fn_check)
+    assert okf and reas == "ok", (okf, reas)
+
+    # failing check via run_with_check: check_ok False + stage check (function)
+    okf2, reas2, _info = model_correction.evaluate("Write a function that doubles.", fn_answer,
+                                           "assert False", require_check=True)
+    assert not okf2 and reas2.startswith("check_failed"), (okf2, reas2)
+
+    # failing check via run_with_check: check_ok False + stage check (class/register)
+    okc, reas3, _info = model_correction.evaluate("Add an operator.", CLASS_REGISTER_ANSWER,
+                                          "assert False", require_check=True)
+    assert not okc and reas3.startswith("check_failed"), (okc, reas3)
+
+    # operator check that calls the operator through bpy.ops -> passes
+    okp, resp, _info = model_correction.evaluate("Add an operator.", CLASS_REGISTER_ANSWER,
+                                         "bpy.ops.object.thing()", require_check=True)
+    assert okp and resp == "ok", (okp, resp)
+
+    # answer using hasattr to dodge a missing API -> never-taken body -> low_coverage
+    has_answer = "```python\nimport bpy\ndef set_flag(obj, attr):\n    if hasattr(obj, attr):\n        setattr(obj, attr, True)\n```"
+    okh, reh, _info = model_correction.evaluate("Set a flag on an object.", has_answer, "",
+                                        require_check=False)
+    assert not okh and reh.startswith("low_coverage:"), (okh, reh)
+
+    # object-vs-name mismatch: answer returns objects, check wants strings -> check fails
+    obj_answer = "```python\ndef get_objects():\n    return list(bpy.data.objects)\n```"
+    oko, rea, _info = model_correction.evaluate("List Blender objects.", obj_answer,
+                                        "assert all(isinstance(o, str) for o in get_objects())",
+                                        require_check=True)
+    assert not oko and rea.startswith("check_failed"), (oko, rea)
 
     good = "```python\nimport bpy\nbpy.ops.mesh.primitive_cube_add(size=2, align='CURSOR')\n```"
     rows = [
@@ -167,6 +240,31 @@ def check_execution():
     assert "How do I add a cube?" in questions, questions
     assert "How do I add a cube three times?" in questions, questions
     assert "How do I add a cube twice?" not in questions, questions
+
+    # prose quality: bloated or COT-heavy prose on a passing small answer
+    # -> the big model's clean reference should be preferred.
+    def bad_prose(answer: str) -> bool:
+        prose = answer.split("```", 1)[0]
+        return len(prose) > 600 or any(m in prose.lower() for m in validator.COT_MARKERS)
+
+    assert bad_prose("Actually, let me just do it.\n\n```python\nimport bpy\n```")
+    assert not bad_prose("Use primitive_cube_add.\n\n```python\nimport bpy\n```")
+
+    with tempfile.TemporaryDirectory() as d:
+        model_correction.OUTPUT = Path(d) / "corrections.jsonl"
+        model_correction.evaluate = lambda question, answer, check="", require_check=False: (
+            True, "ok", model_correction._empty_info())
+        model_correction.correct = lambda question, small_answer, reason, reference="", reference_check="": (
+            None, "", model_correction._empty_info())
+        item = {"question": "q1", "reference": "Ref answer.\n\n```python\nimport bpy\n```",
+                "reference_check": "chk", "attempts": 0}
+        small = "prose. " * 200 + "\n\n```python\nimport bpy\n```"
+        row, key = model_correction.process(item, lambda s: None, small_answer=small)
+        assert key == "passed" and row["answer_source"] == "reference", (key, row)
+        model_correction.evaluate = lambda question, answer, check="", require_check=False: (
+            False, "bad", model_correction._empty_info())
+        row2, key2 = model_correction.process(item, lambda s: None, small_answer=small)
+        assert key2 == "rejected" and row2["answer_source"] == "small", (key2, row2)
 
 
 if shutil.which(config.BLENDER_BIN) is None:

@@ -348,7 +348,8 @@ def _check_deprecated(code: str):
     return reasons
 
 
-COT_MARKERS = ("wait,", "let's look closer", "hmm", "step 1")
+COT_MARKERS = ("wait", "actually,", "however, since", "let's stick", "let me",
+               "let's look closer", "hmm", "step 1")
 
 
 def validate_format(answer: str, task_type: str) -> "str | None":
