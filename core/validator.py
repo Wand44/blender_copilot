@@ -1,9 +1,9 @@
 """Static validation for synthetic Blender Q&A samples.
 
 Ground truth is data/generated/bpy_api_cache.json built by build_api_cache.py.
+Text/hash helpers live in core.code so every pipeline step shares one copy.
 """
 import ast
-import hashlib
 import json
 import os
 import re
@@ -12,7 +12,8 @@ import warnings
 from collections import Counter
 from typing import Optional
 
-import config
+from core import code as code_mod
+from core import config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE_PATH = str(config.CACHE_PATH)
@@ -20,20 +21,21 @@ DOC_FILE = str(config.DOC_FILE)
 BLENDER_BIN = config.BLENDER_BIN
 TARGET_BLENDER = config.TARGET_BLENDER
 
-FENCE_RE = re.compile(r"```python(.*?)```", re.DOTALL)
+FENCE_RE = code_mod.FENCE_RE
 BPY_RE = re.compile(r"\bbpy\.([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*)")
 BL_RE = re.compile(r"^\s*(bl_\w+)\s*[:=]", re.MULTILINE)
 FAKE_NAMES = {"add_per_event", "bl_wide", "bl_height"}
 VALID_BL_EXTRA = {"bl_info"}
 VALID_STATUS = {"FINISHED", "CANCELLED", "PASS_THROUGH", "RUNNING_MODAL", "INTERFACE"}
 
-# Old generator template; stripped when merging old rows in combine_data.
-LEGACY_HEADING_RE = re.compile(
-    r"^[12]\) (?:Architecture Overview|The Code)[ \t]*\n(?:[ \t]*\n)?", re.MULTILINE)
-
-
-def normalize_answer(answer: str) -> str:
-    return LEGACY_HEADING_RE.sub("", answer).lstrip("\n")
+# Re-exported for older callers and tests.
+LEGACY_HEADING_RE = code_mod.LEGACY_HEADING_RE
+normalize_answer = code_mod.normalize_answer
+code_hash = code_mod.code_hash
+extract_fences = code_mod.extract_fences
+fim_full_code = code_mod.fim_full_code
+is_raw_code = code_mod.is_raw_code
+parse_ok = code_mod.parse_ok
 
 _cache = None
 
@@ -63,30 +65,6 @@ def load_cache():
     _cache["_doc_types"] = doc_types
     _cache["_doc_ops"] = doc_ops
     return _cache
-
-
-def code_hash(answer: str) -> str:
-    blocks = FENCE_RE.findall(answer)
-    if not blocks:
-        blocks = [answer]
-    body = "\n---\n".join(b.strip() for b in blocks)
-    return hashlib.md5(re.sub(r"\s+", " ", body).encode()).hexdigest()
-
-
-def extract_fences(text: str):
-    return [b for b in FENCE_RE.findall(text)]
-
-
-def fim_full_code(question: str, answer: str) -> "str | None":
-    """Rebuild the full snippet from a FIM question and its middle-span answer."""
-    m = re.search(r"<\|fim_prefix\|>(.*?)<\|fim_suffix\|>(.*?)<\|fim_middle\|>",
-                  question, re.DOTALL)
-    if not m:
-        return None
-    blocks = extract_fences(answer)
-    middle = blocks[0] if blocks else ""
-    return "\n".join(part.strip("\n")
-                     for part in (m.group(1), middle, m.group(2)) if part)
 
 
 SIG_LINE_RE = re.compile(
@@ -119,26 +97,6 @@ def validate_reference(block: str, classes: set) -> Optional[str]:
         if p not in set(cache["ops"]) and p not in cache["_doc_ops"]:
             return f"invented_api_reference:bpy.ops.{p}"
     return None
-
-
-def is_raw_code(text: str) -> bool:
-    """True when a block of text is pure code (used when auto-fencing raw sources)."""
-    lines = [l for l in text.splitlines() if l.strip()]
-    if not lines:
-        return False
-    codeish = sum(1 for l in lines if re.match(
-        r"^\s*(class |def |import |from |@|[A-Za-z_]\w*\s*=|bpy\.|#)", l))
-    return codeish / len(lines) >= 0.6
-
-
-def parse_ok(code: str) -> bool:
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", SyntaxWarning)
-            ast.parse(code)
-        return True
-    except SyntaxError:
-        return False
 
 
 def _sample_defined_names(code: str):

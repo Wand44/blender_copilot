@@ -21,14 +21,20 @@ from pathlib import Path
 
 import requests
 
+from core.gpu import warn_if_busy
+from core.progress import emit
+
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+ROOT = HERE.parent
+BENCH_DIR = ROOT / "bench"
+sys.path.insert(0, str(BENCH_DIR))
 from cases import CASES  # noqa: E402
 
 BLENDER = os.environ.get("BLENDER_BIN", "blender")
-RUNNER = HERE / "blender_runner.py"
-OLLAMA = "http://localhost:11434/api/chat"
-MODEL = "qwen3.5:4b"
+RUNNER = BENCH_DIR / "blender_runner.py"
+RESULTS = ROOT / "bench" / "results"
+OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
+MODEL = "qwen3.5:9b"
 RUN_TIMEOUT = 60
 FENCE = re.compile(r"```python[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -38,14 +44,16 @@ def extract_code(response):
     return match.group(1) if match else response
 
 
-def ask_ollama(prompt, temperature):
+def ask_ollama(prompt, temperature, model=None, think=False):
     try:
         resp = requests.post(
             OLLAMA,
             json={
-                "model": MODEL,
+                "model": model or MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
+                # thinking mode can burn thousands of tokens and return no code
+                "think": bool(think),
                 "options": {"temperature": temperature},
             },
             timeout=600,
@@ -117,12 +125,15 @@ def validate(jobs):
     return 0
 
 
-def benchmark(samples_per_case, temperature, jobs):
+def benchmark(samples_per_case, temperature, jobs, model=None, think=False):
+    model = model or MODEL
     samples = []
+    total = len(CASES) * samples_per_case
+    done = 0
     for case in CASES:
         print(f"querying {case['id']} x{samples_per_case} ...", flush=True)
         for _ in range(samples_per_case):
-            response = ask_ollama(case["prompt"], temperature)
+            response = ask_ollama(case["prompt"], temperature, model=model, think=think)
             samples.append({
                 "id": case["id"],
                 "tier": case["tier"],
@@ -130,6 +141,8 @@ def benchmark(samples_per_case, temperature, jobs):
                 "response": response,
                 "code": extract_code(response),
             })
+            done += 1
+            emit(done, total * 2, f"queried {case['id']} ({done}/{total})")
 
     print(f"running {len(samples)} blender processes ...", flush=True)
     case_by_id = {c["id"]: c for c in CASES}
@@ -141,9 +154,12 @@ def benchmark(samples_per_case, temperature, jobs):
     for sample, (status, error) in zip(samples, outcomes):
         sample["status"] = status
         sample["error"] = error
+        done += 1
+        emit(done, total * 2, f"checked {sample['id']}",
+             case=sample["id"], status=status)
 
     summary = summarize(samples, samples_per_case)
-    path = save(samples, summary, samples_per_case, temperature)
+    path = save(samples, summary, samples_per_case, temperature, model=model, think=think)
     print_summary(summary)
     print(f"\nwrote {path}")
     return 0
@@ -172,14 +188,15 @@ def summarize(samples, samples_per_case):
     }
 
 
-def save(samples, summary, samples_per_case, temperature):
-    out_dir = HERE.parent / "results"
-    out_dir.mkdir(exist_ok=True)
+def save(samples, summary, samples_per_case, temperature, model=None, think=False):
+    model = model or MODEL
+    RESULTS.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = out_dir / f"{stamp}_{MODEL.replace(':', '-').replace('/', '-')}.json"
+    path = RESULTS / f"{stamp}_{model.replace(':', '-').replace('/', '-')}.json"
     path.write_text(json.dumps({
-        "model": MODEL,
+        "model": model,
         "timestamp": stamp,
+        "think": bool(think),
         "samples_per_case": samples_per_case,
         "temperature": temperature,
         "summary": summary,
@@ -213,13 +230,22 @@ def main():
                         help="run every case's reference instead of the model")
     parser.add_argument("--jobs", type=int, default=4,
                         help="parallel Blender processes (default 4)")
+    parser.add_argument("--model", default=MODEL,
+                        help=f"Ollama model name (default {MODEL})")
+    parser.add_argument("--think", dest="think", action="store_true",
+                        help="enable Ollama thinking mode")
+    parser.add_argument("--no-think", dest="think", action="store_false",
+                        help="disable Ollama thinking mode (default)")
+    parser.set_defaults(think=False)
     args = parser.parse_args()
 
     if args.samples < 1:
         parser.error("--samples must be at least 1")
     if args.validate:
         return validate(args.jobs)
-    return benchmark(args.samples, args.temperature, args.jobs)
+    warn_if_busy()
+    return benchmark(args.samples, args.temperature, args.jobs,
+                     model=args.model, think=args.think)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 from typing import Dict, List, Tuple
 
-import config
+from core import config
 
 BLENDER_BIN = config.BLENDER_BIN
 RUN_TIMEOUT = int(os.environ.get("BLENDER_EXEC_TIMEOUT", "120"))
