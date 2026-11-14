@@ -136,6 +136,22 @@ with tempfile.TemporaryDirectory() as d:
     assert len(rows) == 1 and rows[0]["answer"] == "a1", rows
     assert not [row for row in rows if not row.get("answer")]
 
+# 16a. duplicate ids are renumbered so answering them cannot overwrite one row
+rows = [{"id": 1, "question": "a"}, {"id": 1, "question": "b"},
+        {"id": 2, "question": "c"}]
+assert model_correction.migrate_rows(rows)
+assert [row["id"] for row in rows] == [1, 3, 2], rows
+assert model_correction.migrate_rows(rows) is False, "second pass must be stable"
+
+# 16a2. same question, different ids: save_row updates by id, not by the text
+with tempfile.TemporaryDirectory() as d:
+    path = Path(d) / "same_question.jsonl"
+    model_correction.append_jsonl(path, {"id": 1, "question": "q", "answer": "old"})
+    model_correction.append_jsonl(path, {"id": 2, "question": "q"})
+    model_correction.save_row(path, {"id": 2, "question": "q", "answer": "new"})
+    rows = model_correction.read_jsonl(path)
+    assert [row.get("answer") for row in rows] == ["old", "new"], rows
+
 # 16b. concurrent workers don't lose rows (the file lock)
 with tempfile.TemporaryDirectory() as d:
     path = Path(d) / "concurrent.jsonl"
@@ -316,7 +332,7 @@ def check_execution():
 
     good = "```python\nimport bpy\nbpy.ops.mesh.primitive_cube_add(size=2, align='CURSOR')\n```"
     rows = [
-        {"question": "How do I add a cube?", "answer": good, "validated": True},
+        {"id": 1, "question": "How do I add a cube?", "answer": good, "validated": True},
         {"question": "How do I add a cube twice?", "answer": good,
          "validated": "unverified"},
         {"question": "How do I add a cube three times?", "answer": good},
@@ -328,6 +344,7 @@ def check_execution():
                 f.write(json.dumps(row) + "\n")
         kept = combine_data.load_clean("model_corrections", str(path))
     questions = [row["question"] for row in kept]
+    assert all(isinstance(row["id"], str) for row in kept), kept
     assert "How do I add a cube?" in questions, questions
     assert "How do I add a cube three times?" in questions, questions
     assert "How do I add a cube twice?" not in questions, questions

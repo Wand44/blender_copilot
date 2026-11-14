@@ -93,8 +93,7 @@ def classify_strategy(question: str, answer: str) -> str:
 
 
 def _row_id(source_key: str, mapped: str, row: dict, line_no: int):
-    if mapped == "correction" and isinstance(row.get("id"), int):
-        return row["id"]
+    # Always a string: mixed int/string ids break typed JSON readers.
     if row.get("id") not in (None, ""):
         return f"{mapped}:{row['id']}"
     return f"{mapped}:{line_no}"

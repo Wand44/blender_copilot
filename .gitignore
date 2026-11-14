@@ -3,5 +3,11 @@
 .gitignore
 logs/
 __pycache__/
+data/final/val.jsonl
+data/final/preference_pairs.jsonl
 *.bak
 results/
+*.gguf
+export_metadata.json
+data/final.bak.*/
+new model/

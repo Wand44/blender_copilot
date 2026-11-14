@@ -167,11 +167,17 @@ def migrate_rows(rows, small_model: str = SMALL_MODEL) -> bool:
     """Assign stable ids and normalize legacy rows. Returns True if changed."""
     changed = False
     next_id = _next_id(rows)
+    seen = set()
     for row in rows:
         if not isinstance(row.get("id"), int):
             row["id"] = next_id
             next_id += 1
             changed = True
+        if row["id"] in seen:
+            row["id"] = next_id
+            next_id += 1
+            changed = True
+        seen.add(row["id"])
         if not row.get("producing_model"):
             row["producing_model"] = "legacy" if row.get("validated") is True else "unknown"
             changed = True
@@ -217,7 +223,10 @@ def save_row(path: Path, question=None, row=None) -> None:
         rows = read_jsonl(path)
         for index, existing in enumerate(rows):
             same_id = row.get("id") is not None and existing.get("id") == row.get("id")
-            same_q = not same_id and existing.get("question") == (question or row.get("question"))
+            # Only fall back to the question when the new row has no id; with ids
+            # present, a duplicate question must not overwrite a different row.
+            same_q = row.get("id") is None and existing.get("question") == (
+                question or row.get("question"))
             if same_id or same_q:
                 rows[index] = row
                 break
@@ -361,6 +370,14 @@ def correct(question: str, small_answer: str, reason: str,
     attempt_code = last_candidate or small_answer
     why = reason
     info = _empty_info()
+    # The big model already wrote a reference answer with the question: try it
+    # before spending another call (and an execution run) on a rewrite.
+    if reference:
+        ref_ok, _ref_why, ref_info = evaluate(
+            question, reference, reference_check,
+            require_check=bool(reference_check.strip()))
+        if ref_ok:
+            return reference, reference_check, ref_info, history, "reference", start_attempt
     for attempt in range(max(1, start_attempt), max_attempts + 1):
         if status:
             status("fixing with big model", attempt)
@@ -497,7 +514,8 @@ def main():
     parser.add_argument("--generate", type=int, default=0,
                         help="generate N new questions before processing")
     parser.add_argument("--questions", type=int, default=0,
-                        help="alias for --generate (kept for old commands)")
+                        help="target unfinished questions this run; new questions "
+                             "fill the gap (0 = process only)")
     parser.add_argument("--workers", type=int, default=1,
                         help="ignored: correction is strictly sequential")
     parser.add_argument("--timeout", type=int,
@@ -532,7 +550,10 @@ def main():
     next_id = _next_id(rows)
     total = len(rows)
 
-    generate_count = args.generate or args.questions
+    generate_count = args.generate
+    if not generate_count:
+        pending = _select_pending(rows, args.max_attempts)
+        generate_count = max(0, args.questions - len(pending))
     if generate_count:
         validator.load_cache()
         big.POOL.refresh(big._headers())
@@ -599,7 +620,7 @@ def main():
               f"(attempts {row.get('attempts')}/{args.max_attempts}, "
               f"producer {row.get('producing_model')})", flush=True)
         emit(index, len(pending), f"id {row_id}: {key}",
-             id=row_id, status=key, total=total,
+             id=row_id, status=key, dataset_total=total,
              attempts=row.get("attempts"), producing_model=row.get("producing_model"))
 
     print(f"Done: {counts['passed']} passed, {counts['corrected']} corrected, "

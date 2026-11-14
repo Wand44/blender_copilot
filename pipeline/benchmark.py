@@ -21,20 +21,22 @@ from pathlib import Path
 
 import requests
 
-from core.gpu import warn_if_busy
-from core.progress import emit
-
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 BENCH_DIR = ROOT / "bench"
 sys.path.insert(0, str(BENCH_DIR))
+sys.path.insert(0, str(ROOT))
+
+from core.gpu import warn_if_busy
+from core.progress import emit
+
 from cases import CASES  # noqa: E402
 
 BLENDER = os.environ.get("BLENDER_BIN", "blender")
 RUNNER = BENCH_DIR / "blender_runner.py"
 RESULTS = ROOT / "bench" / "results"
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
-MODEL = "qwen3.5:9b"
+MODEL = "qwen3.5:4b"
 RUN_TIMEOUT = 60
 FENCE = re.compile(r"```python[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
