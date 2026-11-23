@@ -6,19 +6,27 @@ the real Blender API (see validator.py) before being written.
 """
 import os
 import ast
+import difflib
 import logging
 import json
 import time
 import random
 import requests
 import re
+import sys
+import tempfile
+import textwrap
 import threading
 import subprocess
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
 from typing import Dict, List, Any, Optional
+
+# Allow `python3 pipeline/generate_synthetic.py` from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import config, execution_validator, validator
 from core.gpu import warn_if_busy
@@ -217,6 +225,17 @@ def call_llm(prompt: str, system_prompt: str, timeout: int = None,
 
 def last_model() -> str:
     return getattr(_LAST_MODEL, "value", "")
+
+
+def validate_candidate(question: str, answer: str, gen_type, seen_hashes: set,
+                       execute: bool = True):
+    """Single validation path for every generated row (LLM and targeted)."""
+    ok, reason = validator.validate_sample(question, answer, gen_type,
+                                           seen_hashes, strict_format=True)
+    if ok and execute:
+        blocks = validator.extract_fences(answer)
+        ok, reason = execution_validator.validate(blocks[0] if blocks else "")
+    return ok, reason
 
 
 def parse_delimited(text: str) -> Dict[str, str]:
@@ -424,6 +443,8 @@ def main():
                         help="print N random accepted samples at the end")
     parser.add_argument("--no-execute", action="store_true",
                         help="skip headless-Blender execution validation")
+    parser.add_argument("--batch", type=int, default=20,
+                        help="targeted rows per area this run (0 = skip)")
     args = parser.parse_args()
     execute = not args.no_execute
     print("--- SCRIPT STARTING ---")
@@ -504,12 +525,8 @@ def main():
             # Because a malformed Q&A pair is useless for supervised fine-tuning
             # even if the code is correct; the model learns from the exact
             # question/answer text, so shape and fences matter as much as API.
-            ok, reason = validator.validate_sample(res["question"], res["answer"],
-                                                   gen_type, seen_hashes,
-                                                   strict_format=True)
-            if ok and execute:
-                blocks = validator.extract_fences(res["answer"])
-                ok, reason = execution_validator.validate(blocks[0] if blocks else "")
+            ok, reason = validate_candidate(res["question"], res["answer"],
+                                            gen_type, seen_hashes, execute)
             stats.record(gen_type, reason)
             if ok:
                 row = {"question": res["question"], "answer": res["answer"],
@@ -557,6 +574,13 @@ def main():
                             execute, stats)
     print(f"Added {added} FIM rows.")
 
+    # Targeted (deterministic) rows: error-fix + topic coverage, validated
+    # through the same validate_candidate path as the LLM rows above.
+    remaining = CONFIG["cap"] - state["accepted"]
+    added = run_targeted(CONFIG["output_file"], args.batch, seen_hashes,
+                         execute, remaining)
+    state["accepted"] += added
+
     print("\n--- RUN REPORT (per type / rejection reason) ---")
     print(stats.report())
     if args.show and accepted_rows:
@@ -565,6 +589,858 @@ def main():
             print(f"\n{'='*70}\n[type={row['type']} seed={row['seed_id']}]\n"
                   f"QUESTION: {row['question']}\n\nANSWER: {row['answer']}")
     print("--- SCRIPT FINISHED ---")
+
+
+# ==============================================================================
+# TARGETED (DETERMINISTIC) ROWS: error-fix + topic coverage
+# ==============================================================================
+BLENDER = config.BLENDER_BIN
+
+
+def run_blender_code(code, timeout=60):
+    script = textwrap.dedent("""\
+        import bpy, json, sys, traceback
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        if not bpy.data.scenes:
+            bpy.data.scenes.new("Scene")
+        bpy.ops.mesh.primitive_cube_add()
+        ns = {"bpy": bpy, "__name__": "__main__"}
+        try:
+            exec(compile(sys.argv[-1], "<code>", "exec"), ns)
+            print("###RES###" + json.dumps({"ok": True}))
+        except Exception as e:
+            tb = traceback.format_exc()
+            print("###RES###" + json.dumps({
+                "ok": False,
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "traceback": tb,
+            }))
+        bpy.ops.wm.quit_blender()
+    """)
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        proc = subprocess.run(
+            [BLENDER, "-b", "--factory-startup", "--python", path, "--", code],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "TimeoutError", f"exceeded {timeout}s", ""
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    for line in reversed(proc.stdout.splitlines()):
+        if line.startswith("###RES###"):
+            try:
+                out = json.loads(line[len("###RES###"):])
+            except ValueError:
+                continue
+            return out.get("ok", False), out.get("error_type", ""), out.get("error", ""), out.get("traceback", "")
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+    return False, "Crash", " | ".join(tail), ""
+
+
+def make_answer(opener, code):
+    opener = (opener or "").strip()
+    block = f"```python\n{code.strip()}\n```"
+    return f"{opener}\n{block}" if opener else block
+
+
+BASE_SCRIPTS = [
+("monkey_subdiv", """import bpy
+bpy.ops.mesh.primitive_monkey_add(location=(0, 0, 1))
+obj = bpy.context.active_object
+obj.name = "Suzanne"
+mod = obj.modifiers.new(name="Subsurf", type='SUBSURF')
+mod.levels = 2
+bpy.ops.object.shade_smooth()
+"""),
+("camera_track", """import bpy
+cam_data = bpy.data.cameras.new(name="Cam")
+cam = bpy.data.objects.new("Cam", cam_data)
+bpy.context.collection.objects.link(cam)
+cam.location = (0, -6, 3)
+target = bpy.context.active_object
+if target:
+    con = cam.constraints.new(type='TRACK_TO')
+    con.target = target
+    con.track_axis = 'TRACK_NEGATIVE_Z'
+    con.up_axis = 'UP_Y'
+"""),
+("point_light_energy", """import bpy
+light_data = bpy.data.lights.new(name="Fill", type='POINT')
+light_data.energy = 500
+light = bpy.data.objects.new("Fill", light_data)
+bpy.context.collection.objects.link(light)
+light.location = (3, -3, 4)
+"""),
+("material_assign_slots", """import bpy
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    mat = bpy.data.materials.new(name="BlueMat")
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if bsdf:
+        bsdf.inputs["Base Color"].default_value = (0, 0, 1, 1)
+    if obj.data.materials:
+        obj.data.materials[0] = mat
+    else:
+        obj.data.materials.append(mat)
+"""),
+("render_output", """import bpy
+scene = bpy.context.scene
+scene.render.engine = 'CYCLES'
+scene.cycles.samples = 64
+scene.render.resolution_x = 1280
+scene.render.resolution_y = 720
+scene.render.filepath = "/tmp/render.png"
+"""),
+("keyframe_scale", """import bpy
+obj = bpy.context.active_object
+if obj:
+    obj.scale = (1, 1, 1)
+    obj.keyframe_insert(data_path="scale", frame=1)
+    obj.scale = (2, 2, 2)
+    obj.keyframe_insert(data_path="scale", frame=24)
+"""),
+("fcurve_linear", """import bpy
+obj = bpy.context.active_object
+if obj and obj.animation_data and obj.animation_data.action:
+    action = obj.animation_data.action
+    for fc in action.fcurves:
+        if fc.data_path == "location":
+            for kp in fc.keyframe_points:
+                kp.interpolation = 'LINEAR'
+"""),
+("bmesh_bevel", """import bpy
+import bmesh
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    edges = [e for e in bm.edges]
+    bmesh.ops.bevel(bm, geom=edges, offset=0.05, segments=2, affect='EDGES')
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.object.mode_set(mode='OBJECT')
+"""),
+("from_pydata_pyramid", """import bpy
+verts = [(1,1,0),(1,-1,0),(-1,-1,0),(-1,1,0),(0,0,2)]
+faces = [(0,1,2,3),(0,1,4),(1,2,4),(2,3,4),(3,0,4)]
+mesh = bpy.data.meshes.new("PyramidMesh")
+mesh.from_pydata(verts, [], faces)
+mesh.update()
+obj = bpy.data.objects.new("Pyramid", mesh)
+bpy.context.collection.objects.link(obj)
+"""),
+("collection_create_link", """import bpy
+col = bpy.data.collections.new("Assets")
+bpy.context.scene.collection.children.link(col)
+obj = bpy.context.active_object
+if obj and obj.name in bpy.context.scene.collection.objects:
+    bpy.context.scene.collection.objects.unlink(obj)
+    col.objects.link(obj)
+"""),
+("parent_objects", """import bpy
+bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
+parent = bpy.context.active_object
+bpy.ops.mesh.primitive_uv_sphere_add(location=(0, 0, 2))
+child = bpy.context.active_object
+child.parent = parent
+child.matrix_parent_inverse = parent.matrix_world.inverted()
+"""),
+("shader_mix", """import bpy
+mat = bpy.data.materials.new(name="MixMat")
+mat.use_nodes = True
+nodes = mat.node_tree.nodes
+links = mat.node_tree.links
+nodes.clear()
+out = nodes.new(type="ShaderNodeOutputMaterial")
+bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+"""),
+("rename_objects_loop", """import bpy
+for i, obj in enumerate(bpy.data.objects):
+    if obj.type == 'MESH':
+        obj.name = f"Mesh_{i:02d}"
+"""),
+("hide_collection_view", """import bpy
+col = bpy.context.scene.collection
+for obj in col.objects:
+    obj.hide_viewport = False
+    obj.hide_render = False
+"""),
+("apply_modifier", """import bpy
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    mod = obj.modifiers.new(name="Bevel", type='BEVEL')
+    mod.width = 0.1
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+"""),
+("cursor_to_selected", """import bpy
+obj = bpy.context.active_object
+if obj:
+    bpy.context.scene.cursor.location = obj.location.copy()
+"""),
+("duplicate_object", """import bpy
+obj = bpy.context.active_object
+if obj:
+    new_obj = obj.copy()
+    new_obj.data = obj.data.copy()
+    new_obj.location.x += 2.0
+    bpy.context.collection.objects.link(new_obj)
+"""),
+("text_object", """import bpy
+curve = bpy.data.curves.new(type="FONT", name="TextCurve")
+curve.body = "Hello"
+obj = bpy.data.objects.new(name="Text", object_data=curve)
+bpy.context.collection.objects.link(obj)
+obj.location = (0, 0, 1)
+"""),
+("set_origin", """import bpy
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='MEDIAN')
+"""),
+("smooth_flat_switch", """import bpy
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    bpy.ops.object.shade_flat()
+    bpy.ops.object.shade_smooth()
+"""),
+("world_background", """import bpy
+world = bpy.context.scene.world
+if world is None:
+    world = bpy.data.worlds.new("World")
+    bpy.context.scene.world = world
+world.use_nodes = True
+bg = world.node_tree.nodes.get("Background")
+if bg:
+    bg.inputs[0].default_value = (0.1, 0.1, 0.1, 1)
+"""),
+("add_plane_scale", """import bpy
+bpy.ops.mesh.primitive_plane_add(size=4)
+obj = bpy.context.active_object
+obj.scale = (2, 2, 1)
+"""),
+("select_by_name", """import bpy
+bpy.ops.object.select_all(action='DESELECT')
+obj = bpy.data.objects.get("Cube")
+if obj:
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+"""),
+("edge_split_modifier", """import bpy
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    mod = obj.modifiers.new(name="EdgeSplit", type='EDGE_SPLIT')
+    mod.split_angle = 1.0472
+"""),
+("area_lamp", """import bpy
+light_data = bpy.data.lights.new(name="Area", type='AREA')
+light_data.energy = 200
+obj = bpy.data.objects.new("Area", light_data)
+bpy.context.collection.objects.link(obj)
+obj.location = (0, 0, 5)
+"""),
+("camera_settings", """import bpy
+cam_data = bpy.data.cameras.new(name="CamData")
+cam_data.lens = 35
+cam_obj = bpy.data.objects.new("Camera", cam_data)
+bpy.context.collection.objects.link(cam_obj)
+bpy.context.scene.camera = cam_obj
+"""),
+("frame_range", """import bpy
+scene = bpy.context.scene
+scene.frame_start = 1
+scene.frame_end = 120
+scene.frame_current = 1
+"""),
+("vertex_group_assign", """import bpy
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    vg = obj.vertex_groups.new(name="Group")
+    vg.add([v.index for v in obj.data.vertices], 1.0, 'REPLACE')
+"""),
+("join_meshes", """import bpy
+bpy.ops.object.select_all(action='DESELECT')
+meshes = [o for o in bpy.data.objects if o.type == 'MESH']
+if meshes:
+    for o in meshes:
+        o.select_set(True)
+    bpy.context.view_layer.objects.active = meshes[0]
+    bpy.ops.object.join()
+"""),
+("extrude_bmesh", """import bpy
+import bmesh
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    top = [f for f in bm.faces if f.normal.z > 0.9]
+    if top:
+        bmesh.ops.extrude_face_region(bm, geom=top)
+        bmesh.ops.translate(bm, verts=[v for v in bm.verts if v.select], vec=(0, 0, 1))
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.object.mode_set(mode='OBJECT')
+"""),
+("custom_prop", """import bpy
+obj = bpy.context.active_object
+if obj:
+    obj["my_id"] = 42
+    obj["tag"] = "asset"
+"""),
+("remove_unused_mats", """import bpy
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    obj.data.materials.clear()
+"""),
+("sun_light_rotate", """import bpy
+import math
+light_data = bpy.data.lights.new(name="Sun", type='SUN')
+light_data.energy = 2.0
+obj = bpy.data.objects.new("Sun", light_data)
+bpy.context.collection.objects.link(obj)
+obj.rotation_euler = (math.radians(45), 0, math.radians(30))
+"""),
+("cycles_device", """import bpy
+scene = bpy.context.scene
+scene.render.engine = 'CYCLES'
+scene.cycles.device = 'CPU'
+scene.cycles.samples = 32
+"""),
+("image_texture_node", """import bpy
+mat = bpy.data.materials.new(name="TexMat")
+mat.use_nodes = True
+nodes = mat.node_tree.nodes
+links = mat.node_tree.links
+tex = nodes.new(type="ShaderNodeTexImage")
+bsdf = nodes.get("Principled BSDF")
+if bsdf:
+    links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+"""),
+("duplicate_linked", """import bpy
+obj = bpy.context.active_object
+if obj:
+    dup = obj.copy()
+    dup.location.y += 2.0
+    bpy.context.collection.objects.link(dup)
+"""),
+("snap_cursor", """import bpy
+bpy.ops.view3d.snap_cursor_to_center()
+"""),
+("array_modifier", """import bpy
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    mod = obj.modifiers.new(name="Array", type='ARRAY')
+    mod.count = 5
+    mod.relative_offset_displace = (1.2, 0, 0)
+"""),
+("boolean_modifier", """import bpy
+bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
+a = bpy.context.active_object
+bpy.ops.mesh.primitive_uv_sphere_add(location=(0.5, 0, 0))
+b = bpy.context.active_object
+mod = a.modifiers.new(name="Bool", type='BOOLEAN')
+mod.operation = 'DIFFERENCE'
+mod.object = b
+"""),
+("collection_instance", """import bpy
+col = bpy.data.collections.get("Assets")
+if col is None:
+    col = bpy.data.collections.new("Assets")
+    bpy.context.scene.collection.children.link(col)
+inst = bpy.data.objects.new("AssetsInstance", None)
+inst.instance_type = 'COLLECTION'
+inst.instance_collection = col
+bpy.context.collection.objects.link(inst)
+"""),
+("animation_action_name", """import bpy
+obj = bpy.context.active_object
+if obj and obj.animation_data and obj.animation_data.action:
+    obj.animation_data.action.name = "WalkCycle"
+"""),
+("mesh_normals", """import bpy
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    mesh = obj.data
+    mesh.normals_split_custom_set_from_vertices([v.normal for v in mesh.vertices])
+"""),
+]
+
+# ensure >=40
+assert len(BASE_SCRIPTS) >= 40, len(BASE_SCRIPTS)
+
+
+def _replace_once(code, old, new):
+    if old in code:
+        return code.replace(old, new, 1)
+    return None
+
+def b_scene_link(code):
+    return _replace_once(code, "bpy.context.collection.objects.link", "bpy.context.scene.objects.link")
+def b_scene_active(code):
+    return re.sub(r"bpy\.context\.view_layer\.objects\.active", "bpy.context.scene.objects.active", code) if "view_layer.objects.active" in code else None
+def b_matmul_star(code):
+    return re.sub(r"(\w+(?:\.\w+)*(?:\([^)]*\))?)\s*@\s*(\w+(?:\.\w+)*(?:\([^)]*\))?)", r"\1 * \2", code, count=1) if "@" in code else None
+def b_float_location(code):
+    m = re.search(r"(\w+)\.location\s*=\s*\([^\)]+\)", code)
+    if m:
+        return re.sub(rf"{re.escape(m.group(1))}\.location\s*=\s*\([^\)]+\)", f"{m.group(1)}.location = 1.0", code, count=1)
+    return None
+def b_float_scale(code):
+    m = re.search(r"(\w+)\.scale\s*=\s*\([^\)]+\)", code)
+    if m:
+        return re.sub(rf"{re.escape(m.group(1))}\.scale\s*=\s*\([^\)]+\)", f"{m.group(1)}.scale = 2.0", code, count=1)
+    return None
+def b_wrong_op_cube(code):
+    return _replace_once(code, "bpy.ops.mesh.primitive_cube_add", "bpy.ops.mesh.add_cube")
+def b_wrong_op_sphere(code):
+    return _replace_once(code, "bpy.ops.mesh.primitive_uv_sphere_add", "bpy.ops.mesh.primitive_sphere_add")
+def b_wrong_op_smooth(code):
+    return _replace_once(code, "bpy.ops.object.shade_smooth", "bpy.ops.object.smooth_shade")
+def b_wrong_op_flat(code):
+    return _replace_once(code, "bpy.ops.object.shade_flat", "bpy.ops.object.flat_shade")
+def b_wrong_op_select_all(code):
+    return _replace_once(code, "bpy.ops.object.select_all", "bpy.ops.object.select_everything")
+def b_wrong_op_monkey(code):
+    return _replace_once(code, "bpy.ops.mesh.primitive_monkey_add", "bpy.ops.mesh.monkey_add")
+def b_wrong_attr_hide_viewport(code):
+    return _replace_once(code, ".hide_viewport", ".hide")
+def b_wrong_attr_use_nodes(code):
+    return _replace_once(code, ".use_nodes", ".use_node")
+def b_wrong_attr_render_engine(code):
+    return _replace_once(code, "render.engine", "render.render_engine")
+def b_wrong_attr_filepath(code):
+    return _replace_once(code, "render.filepath", "render.output_path")
+def b_wrong_attr_lens(code):
+    return _replace_once(code, ".lens", ".focal_length")
+def b_wrong_attr_energy(code):
+    return _replace_once(code, ".energy", ".power")
+def b_wrong_enum_engine(code):
+    return _replace_once(code, "'BLENDER_EEVEE'", "'EEVEE'")
+def b_wrong_enum_interp(code):
+    return _replace_once(code, "'LINEAR'", "'LINE'")
+def b_wrong_enum_track(code):
+    return _replace_once(code, "'TRACK_NEGATIVE_Z'", "'TRACK_Z'")
+def b_readonly_vertices(code):
+    return _replace_once(code, "obj.data.vertices", "obj.vertices")
+def b_readonly_materials(code):
+    return _replace_once(code, "obj.data.materials", "obj.materials")
+def b_wrong_collection_method(code):
+    return _replace_once(code, ".objects.link(", ".objects.append(")
+def b_wrong_collection_unlink(code):
+    return _replace_once(code, ".objects.unlink(", ".objects.remove(")
+def b_removed_import_bmesh(code):
+    if "import bmesh" in code and "bmesh." in code:
+        return code.replace("import bmesh\n", "", 1)
+    return None
+def b_removed_import_math(code):
+    if "import math" in code and "math." in code:
+        return code.replace("import math\n", "", 1)
+    return None
+def b_removed_import_mathutils(code):
+    # not present but try
+    if "import mathutils" in code and "mathutils." in code:
+        return code.replace("import mathutils\n", "", 1)
+    return None
+def b_missing_mode_edit(code):
+    if "bpy.ops.object.mode_set(mode='EDIT')" in code:
+        return code.replace("bpy.ops.object.mode_set(mode='EDIT')\n", "", 1)
+    return None
+def b_missing_mode_object(code):
+    if "bpy.ops.object.mode_set(mode='OBJECT')" in code and "bmesh.update_edit_mesh" in code:
+        return code.replace("bpy.ops.object.mode_set(mode='OBJECT')\n", "", 1)
+    return None
+def b_wrong_context_active(code):
+    # set wrong active before operator
+    if "bpy.context.view_layer.objects.active = " in code:
+        return code.replace("bpy.context.view_layer.objects.active = ", "bpy.context.scene.camera = ", 1)
+    return None
+def b_wrong_select_call(code):
+    return _replace_once(code, "obj.select_set(True)", "obj.select = True")
+def b_wrong_children_link(code):
+    return _replace_once(code, ".children.link(", ".children.append(")
+def b_wrong_modifier_apply(code):
+    return _replace_once(code, "bpy.ops.object.modifier_apply", "bpy.ops.object.apply_modifier")
+def b_wrong_keyframe(code):
+    return _replace_once(code, "keyframe_insert", "insert_keyframe")
+
+BREAKERS = [
+ ("legacy_scene_link", b_scene_link, "In 2.8+ objects are linked to collections, not `scene.objects`."),
+ ("legacy_scene_active", b_scene_active, "`scene.objects.active` was removed; use `view_layer.objects.active`."),
+ ("legacy_matrix_mul", b_matmul_star, "Matrix multiplication uses `@` in Python 3 / Blender 2.8+, not `*`."),
+ ("float_to_location", b_float_location, "Object location is a vector, not a single float."),
+ ("float_to_scale", b_float_scale, "Object scale is a vector, not a single float."),
+ ("wrong_op_cube", b_wrong_op_cube, "The correct operator is `bpy.ops.mesh.primitive_cube_add`."),
+ ("wrong_op_sphere", b_wrong_op_sphere, "Use `bpy.ops.mesh.primitive_uv_sphere_add` for a UV sphere."),
+ ("wrong_op_smooth", b_wrong_op_smooth, "Smooth shading uses `bpy.ops.object.shade_smooth`."),
+ ("wrong_op_flat", b_wrong_op_flat, "Flat shading uses `bpy.ops.object.shade_flat`."),
+ ("wrong_op_select_all", b_wrong_op_select_all, "The operator is `bpy.ops.object.select_all`."),
+ ("wrong_op_monkey", b_wrong_op_monkey, "The operator is `bpy.ops.mesh.primitive_monkey_add`."),
+ ("wrong_attr_hide_viewport", b_wrong_attr_hide_viewport, "Viewport visibility uses `hide_viewport` in 2.8+."),
+ ("wrong_attr_use_nodes", b_wrong_attr_use_nodes, "Materials use the `use_nodes` property."),
+ ("wrong_attr_render_engine", b_wrong_attr_render_engine, "The engine property is `scene.render.engine`."),
+ ("wrong_attr_filepath", b_wrong_attr_filepath, "Output path is set via `scene.render.filepath`."),
+ ("wrong_attr_lens", b_wrong_attr_lens, "Camera focal length is stored in `data.lens`."),
+ ("wrong_attr_energy", b_wrong_attr_energy, "Light intensity uses the `energy` property."),
+ ("wrong_enum_engine", b_wrong_enum_engine, "The Eevee engine enum is `BLENDER_EEVEE` in current Blender."),
+ ("wrong_enum_interp", b_wrong_enum_interp, "Keyframe interpolation enum is `LINEAR`, not `LINE`."),
+ ("wrong_enum_track", b_wrong_enum_track, "Track-to axis enum is `TRACK_NEGATIVE_Z`."),
+ ("readonly_vertices", b_readonly_vertices, "Mesh vertices live on `obj.data.vertices`, not `obj.vertices`."),
+ ("readonly_materials", b_readonly_materials, "Material slots live on `obj.data.materials`."),
+ ("wrong_collection_link", b_wrong_collection_method, "Collections use `objects.link(obj)`, not `append`.") ,
+ ("wrong_collection_unlink", b_wrong_collection_unlink, "Use `objects.unlink(obj)` to remove from a collection."),
+ ("missing_import_bmesh", b_removed_import_bmesh, "`bmesh` must be imported before use."),
+ ("missing_import_math", b_removed_import_math, "The `math` module must be imported before use."),
+ ("missing_mode_edit", b_missing_mode_edit, "Edit-mode mesh operators require switching to Edit Mode first."),
+ ("missing_mode_object", b_missing_mode_object, "Return to Object Mode after editing bmesh data."),
+ ("wrong_select_api", b_wrong_select_call, "Selection uses `obj.select_set(True)`, not `obj.select`."),
+ ("wrong_children_link", b_wrong_children_link, "Collection children are linked with `.children.link()`."),
+ ("wrong_modifier_apply", b_wrong_modifier_apply, "Apply modifiers with `bpy.ops.object.modifier_apply(modifier=...)`."),
+ ("wrong_keyframe_insert", b_wrong_keyframe, "Use `keyframe_insert` to insert keyframes."),
+]
+assert len(BREAKERS) >= 30, len(BREAKERS)
+
+
+def trim_traceback(tb):
+    lines = [l.rstrip() for l in (tb or "").splitlines() if l.strip()]
+    # keep relevant tail
+    keep = []
+    for l in lines:
+        if 'File "' in l or l.startswith('Traceback') or 'Error' in l or l.strip().startswith('bpy'):
+            keep.append(l)
+    if not keep:
+        keep = lines[-6:]
+    return "\n".join(keep[-8:])
+
+
+def question_variants(broken, err_text, tb, rng):
+    short = f"{err_text}"
+    full_tb = trim_traceback(tb)
+    variants = [
+        f"This Blender script raises an error. How can I fix it?\n```python\n{broken}\n```\nError: {short}",
+        f"Running this in Blender gives `{short}`. What's wrong and how should it be corrected?\n```python\n{broken}\n```",
+        f"Can you fix this script?\n```python\n{broken}\n```\n```\n{full_tb}\n```",
+        f"I get this traceback when I run my Blender code:\n```\n{full_tb}\n```\nCode:\n```python\n{broken}\n```\nPlease provide a working fix.",
+        f"Why does this fail with {short}?\n```python\n{broken}\n```",
+    ]
+    return rng.choice(variants)
+
+
+A_OPENERS = [
+    lambda exp: exp,
+    lambda exp: exp + " Here's the corrected script.",
+    lambda exp: exp,
+    lambda exp: "The fix is to update the API usage.\n" + exp,
+    lambda exp: "",
+    lambda exp: "Corrected code:",
+]
+
+
+def gen_area_a(n=20, rng_seed=100, seen_hashes=None, execute=True):
+    """Break known-good scripts, capture the real error, pair with the fix."""
+    rng = random.Random(rng_seed)
+    kept = []
+    stats = Counter()
+    pool = []
+    for sname, scode in BASE_SCRIPTS:
+        for tag, fn, explanation in BREAKERS:
+            broken = fn(scode)
+            if broken and broken != scode:
+                pool.append((sname, scode, broken, tag, explanation))
+    rng.shuffle(pool)
+    attempts = 0
+    for sname, fixed, broken, tag, explanation in pool:
+        if len(kept) >= n:
+            break
+        attempts += 1
+        ok_broken, err_type, err_msg, tb = run_blender_code(broken)
+        if ok_broken:
+            stats["broken_ran_ok"] += 1
+            continue
+        err_text = f"{err_type}: {err_msg}".strip()
+        question = question_variants(broken, err_text, tb or err_text, rng)
+        opener = rng.choice(A_OPENERS)(explanation)
+        answer = make_answer(opener, fixed)
+        ok, reason = validate_candidate(question, answer, "bugfix_explained",
+                                        seen_hashes, execute)
+        if not ok:
+            stats[f"verify_reject:{reason}"] += 1
+            continue
+        kept.append({
+            "question": question,
+            "answer": answer,
+            "type": "bugfix_explained",
+            "seed_id": None,
+            "source": "synthetic",
+            "producing_model": "programmatic:targeted",
+            "validated": True,
+            "verified": True,
+            "attempts": 0,
+            "topic_area": f"error_fix/{tag}",
+            "timestamp": utc_now(),
+        })
+        stats[f"kept:{tag}"] += 1
+        stats[f"base:{sname}"] += 1
+    stats["candidates"] = attempts
+    stats["kept_total"] = len(kept)
+    return kept, stats
+
+
+# -------------------- B: topic coverage --------------------
+B_TOPICS = {
+"render_cycles": [
+("How do I switch the render engine to Cycles and set 128 samples?",
+ "import bpy\nscene = bpy.context.scene\nscene.render.engine = 'CYCLES'\nscene.cycles.samples = 128\n"),
+("Set scene.render.engine to CYCLES with 64 render samples in Python.",
+ "import bpy\nscene = bpy.context.scene\nscene.render.engine = 'CYCLES'\nscene.cycles.samples = 64\n"),
+("Configure Cycles preview samples to 32 for the current scene.",
+ "import bpy\nscene = bpy.context.scene\nscene.render.engine = 'CYCLES'\nscene.cycles.preview_samples = 32\n"),
+("Script to use Cycles on CPU with 16 samples.",
+ "import bpy\nscene = bpy.context.scene\nscene.render.engine = 'CYCLES'\nscene.cycles.device = 'CPU'\nscene.cycles.samples = 16\n"),
+("Change the active scene to Cycles and set both render and preview samples.",
+ "import bpy\nscene = bpy.context.scene\nscene.render.engine = 'CYCLES'\nscene.cycles.samples = 48\nscene.cycles.preview_samples = 16\n"),
+],
+"modifiers_shade": [
+("Add a Subdivision Surface modifier to the active mesh and smooth-shade it.",
+ "import bpy\nobj = bpy.context.active_object\nif obj and obj.type == 'MESH':\n    mod = obj.modifiers.new(name='Subsurf', type='SUBSURF')\n    mod.levels = 2\n    bpy.ops.object.shade_smooth()\n"),
+("Give the active mesh a Bevel modifier with width 0.1.",
+ "import bpy\nobj = bpy.context.active_object\nif obj and obj.type == 'MESH':\n    bev = obj.modifiers.new(name='Bevel', type='BEVEL')\n    bev.width = 0.1\n"),
+("How can I add a Solidify modifier and enable smooth shading in one script?",
+ "import bpy\nobj = bpy.context.active_object\nif obj and obj.type == 'MESH':\n    bpy.ops.object.shade_smooth()\n    obj.modifiers.new(name='Solidify', type='SOLIDIFY')\n"),
+("Apply flat shading then add an Array modifier with 3 copies.",
+ "import bpy\nobj = bpy.context.active_object\nif obj and obj.type == 'MESH':\n    bpy.ops.object.shade_flat()\n    mod = obj.modifiers.new(name='Array', type='ARRAY')\n    mod.count = 3\n"),
+("Add an Edge Split modifier to the active mesh.",
+ "import bpy\nobj = bpy.context.active_object\nif obj and obj.type == 'MESH':\n    mod = obj.modifiers.new(name='EdgeSplit', type='EDGE_SPLIT')\n    mod.split_angle = 1.0472\n"),
+],
+"lights_cameras": [
+("Create a point light via bpy.data and link it to the current collection.",
+ "import bpy\nlight_data = bpy.data.lights.new(name='MyLight', type='POINT')\nlight_obj = bpy.data.objects.new(name='MyLight', object_data=light_data)\nbpy.context.collection.objects.link(light_obj)\nlight_obj.location = (2, -2, 3)\n"),
+("Using bpy.data (not operators), add a sun light and set its energy.",
+ "import bpy\nsun = bpy.data.lights.new(name='Sun', type='SUN')\nsun.energy = 3.0\nobj = bpy.data.objects.new(name='Sun', object_data=sun)\nbpy.context.collection.objects.link(obj)\n"),
+("Create a camera datablock and object at (0, -5, 3) and set it active.",
+ "import bpy\ncam_data = bpy.data.cameras.new(name='MyCam')\ncam_obj = bpy.data.objects.new(name='MyCam', object_data=cam_data)\nbpy.context.collection.objects.link(cam_obj)\ncam_obj.location = (0, -5, 3)\nbpy.context.scene.camera = cam_obj\n"),
+("Add an area light with energy 200 using bpy.data APIs.",
+ "import bpy\nlight_data = bpy.data.lights.new(name='Area', type='AREA')\nlight_data.energy = 200\nobj = bpy.data.objects.new(name='Area', light_data)\nbpy.context.collection.objects.link(obj)\nobj.location = (0, 0, 5)\n"),
+("Make a camera with lens 35mm and link it to the scene.",
+ "import bpy\ncam_data = bpy.data.cameras.new(name='Cam35')\ncam_data.lens = 35\ncam_obj = bpy.data.objects.new('Cam35', cam_data)\nbpy.context.collection.objects.link(cam_obj)\n"),
+],
+"animation_fcurves": [
+("Insert location keyframes for the active object at frame 1 and frame 50.",
+ "import bpy\nobj = bpy.context.active_object\nif obj:\n    obj.location = (0, 0, 0)\n    obj.keyframe_insert(data_path='location', frame=1)\n    obj.location = (5, 0, 0)\n    obj.keyframe_insert(data_path='location', frame=50)\n"),
+("Keyframe the active object's Z rotation at frames 1 and 100.",
+ "import bpy\nobj = bpy.context.active_object\nif obj:\n    obj.rotation_euler.z = 0.0\n    obj.keyframe_insert(data_path='rotation_euler', index=2, frame=1)\n    obj.rotation_euler.z = 3.14159\n    obj.keyframe_insert(data_path='rotation_euler', index=2, frame=100)\n"),
+("Set all location fcurve keyframes on the active object to LINEAR interpolation.",
+ "import bpy\nobj = bpy.context.active_object\nif obj and obj.animation_data and obj.animation_data.action:\n    for fc in obj.animation_data.action.fcurves:\n        if fc.data_path == 'location':\n            for kp in fc.keyframe_points:\n                kp.interpolation = 'LINEAR'\n"),
+("Insert a scale keyframe at frame 1 and frame 24 for the active object.",
+ "import bpy\nobj = bpy.context.active_object\nif obj:\n    obj.scale = (1, 1, 1)\n    obj.keyframe_insert(data_path='scale', frame=1)\n    obj.scale = (2, 2, 2)\n    obj.keyframe_insert(data_path='scale', frame=24)\n"),
+("Change interpolation of every keyframe in the active action to BEZIER.",
+ "import bpy\nobj = bpy.context.active_object\nif obj and obj.animation_data and obj.animation_data.action:\n    for fc in obj.animation_data.action.fcurves:\n        for kp in fc.keyframe_points:\n            kp.interpolation = 'BEZIER'\n"),
+],
+"materials_nodes": [
+("Create a node material and set Principled BSDF base color to red.",
+ "import bpy\nmat = bpy.data.materials.new(name='RedMat')\nmat.use_nodes = True\nbsdf = mat.node_tree.nodes.get('Principled BSDF')\nif bsdf:\n    bsdf.inputs['Base Color'].default_value = (1, 0, 0, 1)\n"),
+("Build a material that links Principled BSDF to Material Output.",
+ "import bpy\nmat = bpy.data.materials.new(name='NodeMat')\nmat.use_nodes = True\nnodes = mat.node_tree.nodes\nlinks = mat.node_tree.links\nbsdf = nodes.get('Principled BSDF')\noutput = nodes.get('Material Output')\nif bsdf and output:\n    links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])\n"),
+("Assign a new node material to the active mesh object.",
+ "import bpy\nobj = bpy.context.active_object\nmat = bpy.data.materials.new(name='Assigned')\nmat.use_nodes = True\nif obj and obj.type == 'MESH':\n    if obj.data.materials:\n        obj.data.materials[0] = mat\n    else:\n        obj.data.materials.append(mat)\n"),
+("Add an Image Texture node and connect its Color to Principled BSDF Base Color.",
+ "import bpy\nmat = bpy.data.materials.new(name='TexMat')\nmat.use_nodes = True\nnodes = mat.node_tree.nodes\nlinks = mat.node_tree.links\ntex = nodes.new(type='ShaderNodeTexImage')\nbsdf = nodes.get('Principled BSDF')\nif bsdf:\n    links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])\n"),
+("Create a node setup with a Principled BSDF and set its roughness to 0.2.",
+ "import bpy\nmat = bpy.data.materials.new(name='RoughMat')\nmat.use_nodes = True\nbsdf = mat.node_tree.nodes.get('Principled BSDF')\nif bsdf:\n    bsdf.inputs['Roughness'].default_value = 0.2\n"),
+],
+"bmesh": [
+("Use bmesh to subdivide all edges of the active mesh in edit mode.",
+ "import bpy\nimport bmesh\nobj = bpy.context.active_object\nif obj and obj.type == 'MESH':\n    bpy.ops.object.mode_set(mode='EDIT')\n    bm = bmesh.from_edit_mesh(obj.data)\n    bmesh.ops.subdivide_edges(bm, edges=bm.edges[:], cuts=1, use_grid_fill=True)\n    bmesh.update_edit_mesh(obj.data)\n    bpy.ops.object.mode_set(mode='OBJECT')\n"),
+("Translate all vertices of the active mesh up by 1.0 using bmesh.",
+ "import bpy\nimport bmesh\nobj = bpy.context.active_object\nif obj and obj.type == 'MESH':\n    bm = bmesh.new()\n    bm.from_mesh(obj.data)\n    for v in bm.verts:\n        v.co.z += 1.0\n    bm.to_mesh(obj.data)\n    bm.free()\n"),
+("Bevel all edges of the active mesh with bmesh operators.",
+ "import bpy\nimport bmesh\nobj = bpy.context.active_object\nif obj and obj.type == 'MESH':\n    bpy.ops.object.mode_set(mode='EDIT')\n    bm = bmesh.from_edit_mesh(obj.data)\n    bmesh.ops.bevel(bm, geom=bm.edges[:], offset=0.05, segments=2, affect='EDGES')\n    bmesh.update_edit_mesh(obj.data)\n    bpy.ops.object.mode_set(mode='OBJECT')\n"),
+("Create a bmesh, add a cube primitive, and write it to a new mesh.",
+ "import bpy\nimport bmesh\nbm = bmesh.new()\nbmesh.ops.create_cube(bm, size=2.0)\nmesh = bpy.data.meshes.new('BMeshCube')\nbm.to_mesh(mesh)\nbm.free()\nobj = bpy.data.objects.new('BMeshCube', mesh)\nbpy.context.collection.objects.link(obj)\n"),
+("Delete faces with normal pointing down using bmesh.",
+ "import bpy\nimport bmesh\nobj = bpy.context.active_object\nif obj and obj.type == 'MESH':\n    bm = bmesh.new()\n    bm.from_mesh(obj.data)\n    faces = [f for f in bm.faces if f.normal.z < -0.5]\n    bmesh.ops.delete(bm, geom=faces, context='FACES')\n    bm.to_mesh(obj.data)\n    bm.free()\n"),
+],
+"from_pydata": [
+("Create a quad mesh from vertices and faces with from_pydata.",
+ "import bpy\nverts = [(0,0,0),(1,0,0),(1,1,0),(0,1,0)]\nfaces = [(0,1,2,3)]\nmesh = bpy.data.meshes.new('QuadMesh')\nmesh.from_pydata(verts, [], faces)\nmesh.update()\nobj = bpy.data.objects.new('Quad', mesh)\nbpy.context.collection.objects.link(obj)\n"),
+("Build a triangle mesh using from_pydata and link it.",
+ "import bpy\nverts = [(0,0,0),(2,0,0),(1,2,0)]\nfaces = [(0,1,2)]\nmesh = bpy.data.meshes.new('TriMesh')\nmesh.from_pydata(verts, [], faces)\nmesh.update()\nobj = bpy.data.objects.new('Triangle', mesh)\nbpy.context.collection.objects.link(obj)\n"),
+("Construct a pyramid mesh from_pydata with 5 vertices.",
+ "import bpy\nverts = [(1,1,0),(1,-1,0),(-1,-1,0),(-1,1,0),(0,0,2)]\nfaces = [(0,1,2,3),(0,1,4),(1,2,4),(2,3,4),(3,0,4)]\nmesh = bpy.data.meshes.new('PyramidMesh')\nmesh.from_pydata(verts, [], faces)\nmesh.update()\nobj = bpy.data.objects.new('Pyramid', mesh)\nbpy.context.collection.objects.link(obj)\n"),
+("Make a line mesh from edges using from_pydata.",
+ "import bpy\nverts = [(0,0,0),(1,0,0),(2,1,0),(3,1,0)]\nedges = [(0,1),(1,2),(2,3)]\nmesh = bpy.data.meshes.new('LineMesh')\nmesh.from_pydata(verts, edges, [])\nmesh.update()\nobj = bpy.data.objects.new('Line', mesh)\nbpy.context.collection.objects.link(obj)\n"),
+("Create a custom two-triangle plane via from_pydata.",
+ "import bpy\nverts = [(0,0,0),(2,0,0),(2,2,0),(0,2,0)]\nfaces = [(0,1,2),(0,2,3)]\nmesh = bpy.data.meshes.new('PlaneMesh')\nmesh.from_pydata(verts, [], faces)\nmesh.update()\nobj = bpy.data.objects.new('Plane2', mesh)\nbpy.context.collection.objects.link(obj)\n"),
+],
+"collections_parenting": [
+("Create a new collection, link it to the scene, and move the active object into it.",
+ "import bpy\ncol = bpy.data.collections.new('Assets')\nbpy.context.scene.collection.children.link(col)\nobj = bpy.context.active_object\nif obj and obj.name in bpy.context.scene.collection.objects:\n    bpy.context.scene.collection.objects.unlink(obj)\n    col.objects.link(obj)\n"),
+("Parent one object to another and keep its world transform.",
+ "import bpy\nbpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))\nparent = bpy.context.active_object\nbpy.ops.mesh.primitive_uv_sphere_add(location=(0, 0, 2))\nchild = bpy.context.active_object\nchild.parent = parent\nchild.matrix_parent_inverse = parent.matrix_world.inverted()\n"),
+("Make a nested collection hierarchy under the scene collection.",
+ "import bpy\nparent_col = bpy.data.collections.new('ParentCol')\nchild_col = bpy.data.collections.new('ChildCol')\nbpy.context.scene.collection.children.link(parent_col)\nparent_col.children.link(child_col)\n"),
+("Unlink an object from the scene collection and link it to a custom collection.",
+ "import bpy\ncol = bpy.data.collections.new('Props')\nbpy.context.scene.collection.children.link(col)\nobj = bpy.context.active_object\nif obj and obj.name in bpy.context.scene.collection.objects:\n    bpy.context.scene.collection.objects.unlink(obj)\nif obj:\n    col.objects.link(obj)\n"),
+("Create an empty as parent and parent the active mesh to it.",
+ "import bpy\nempty = bpy.data.objects.new('ParentEmpty', None)\nbpy.context.collection.objects.link(empty)\nobj = bpy.context.active_object\nif obj and obj != empty:\n    obj.parent = empty\n    obj.matrix_parent_inverse = empty.matrix_world.inverted()\n"),
+],
+"camera_render_output": [
+("Set the active camera and configure render resolution and output path.",
+ "import bpy\ncam_data = bpy.data.cameras.new(name='Cam')\ncam_obj = bpy.data.objects.new('Camera', cam_data)\nbpy.context.collection.objects.link(cam_obj)\nbpy.context.scene.camera = cam_obj\nscene = bpy.context.scene\nscene.render.resolution_x = 1920\nscene.render.resolution_y = 1080\nscene.render.filepath = '/tmp/out.png'\n"),
+("Change camera lens and set render percentage to 50%.",
+ "import bpy\ncam_data = bpy.data.cameras.new(name='Cam')\ncam_data.lens = 50\ncam_obj = bpy.data.objects.new('Camera', cam_data)\nbpy.context.collection.objects.link(cam_obj)\nbpy.context.scene.camera = cam_obj\nbpy.context.scene.render.resolution_percentage = 50\n"),
+("Set render output format to PNG and filepath for the scene.",
+ "import bpy\nscene = bpy.context.scene\nscene.render.image_settings.file_format = 'PNG'\nscene.render.filepath = '/tmp/frame.png'\n"),
+("Create a camera, position it, and set frame range for rendering.",
+ "import bpy\ncam_data = bpy.data.cameras.new(name='Cam')\ncam_obj = bpy.data.objects.new('Camera', cam_data)\nbpy.context.collection.objects.link(cam_obj)\ncam_obj.location = (7, -7, 5)\nbpy.context.scene.camera = cam_obj\nscene = bpy.context.scene\nscene.frame_start = 1\nscene.frame_end = 250\n"),
+("Configure render resolution 1280x720 and assign an existing camera if present.",
+ "import bpy\nscene = bpy.context.scene\nscene.render.resolution_x = 1280\nscene.render.resolution_y = 720\nfor obj in bpy.data.objects:\n    if obj.type == 'CAMERA':\n        scene.camera = obj\n        break\n"),
+],
+"shader_node_links": [
+("Create a Principled BSDF and link it to the Material Output surface input.",
+ "import bpy\nmat = bpy.data.materials.new(name='LinkMat')\nmat.use_nodes = True\nnodes = mat.node_tree.nodes\nlinks = mat.node_tree.links\nbsdf = nodes.get('Principled BSDF')\noutput = nodes.get('Material Output')\nif bsdf and output:\n    links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])\n"),
+("Add a Noise Texture node and connect its Fac to Principled Roughness.",
+ "import bpy\nmat = bpy.data.materials.new(name='NoiseMat')\nmat.use_nodes = True\nnodes = mat.node_tree.nodes\nlinks = mat.node_tree.links\nnoise = nodes.new(type='ShaderNodeTexNoise')\nbsdf = nodes.get('Principled BSDF')\nif bsdf:\n    links.new(noise.outputs['Fac'], bsdf.inputs['Roughness'])\n"),
+("Connect an Image Texture Color output to Base Color of Principled BSDF.",
+ "import bpy\nmat = bpy.data.materials.new(name='ImgMat')\nmat.use_nodes = True\nnodes = mat.node_tree.nodes\nlinks = mat.node_tree.links\ntex = nodes.new(type='ShaderNodeTexImage')\nbsdf = nodes.get('Principled BSDF')\nif bsdf:\n    links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])\n"),
+("Wire a UV Map node into an Image Texture vector input.",
+ "import bpy\nmat = bpy.data.materials.new(name='UVMat')\nmat.use_nodes = True\nnodes = mat.node_tree.nodes\nlinks = mat.node_tree.links\nuv = nodes.new(type='ShaderNodeUVMap')\ntex = nodes.new(type='ShaderNodeTexImage')\nlinks.new(uv.outputs['UV'], tex.inputs['Vector'])\n"),
+("Add a Color Ramp between Noise Texture and Principled Base Color.",
+ "import bpy\nmat = bpy.data.materials.new(name='RampMat')\nmat.use_nodes = True\nnodes = mat.node_tree.nodes\nlinks = mat.node_tree.links\nnoise = nodes.new(type='ShaderNodeTexNoise')\nramp = nodes.new(type='ShaderNodeValToRGB')\nbsdf = nodes.get('Principled BSDF')\nlinks.new(noise.outputs['Fac'], ramp.inputs['Fac'])\nif bsdf:\n    links.new(ramp.outputs['Color'], bsdf.inputs['Base Color'])\n"),
+],
+"addon_operator_panel": [
+("Write a minimal add-on with an operator and a 3D View panel that shows a button.",
+ "import bpy\n\nclass MY_OT_hello(bpy.types.Operator):\n    bl_idname = 'my.hello'\n    bl_label = 'Hello'\n    def execute(self, context):\n        self.report({'INFO'}, 'Hello')\n        return {'FINISHED'}\n\nclass MY_PT_panel(bpy.types.Panel):\n    bl_label = 'My Panel'\n    bl_idname = 'MY_PT_panel'\n    bl_space_type = 'VIEW_3D'\n    bl_region_type = 'UI'\n    bl_category = 'MyTab'\n    def draw(self, context):\n        self.layout.operator('my.hello')\n\nclasses = (MY_OT_hello, MY_PT_panel)\n\ndef register():\n    for c in classes:\n        bpy.utils.register_class(c)\n\ndef unregister():\n    for c in reversed(classes):\n        bpy.utils.unregister_class(c)\n\nif __name__ == '__main__':\n    register()\n"),
+("Create an operator that adds a cube and a panel in the 3D View sidebar to run it.",
+ "import bpy\n\nclass MY_OT_add_cube(bpy.types.Operator):\n    bl_idname = 'my.add_cube'\n    bl_label = 'Add Cube'\n    def execute(self, context):\n        bpy.ops.mesh.primitive_cube_add()\n        return {'FINISHED'}\n\nclass MY_PT_panel(bpy.types.Panel):\n    bl_label = 'Add Tools'\n    bl_idname = 'MY_PT_add_tools'\n    bl_space_type = 'VIEW_3D'\n    bl_region_type = 'UI'\n    bl_category = 'Create'\n    def draw(self, context):\n        self.layout.operator('my.add_cube')\n\nclasses = (MY_OT_add_cube, MY_PT_panel)\n\ndef register():\n    for c in classes:\n        bpy.utils.register_class(c)\n\ndef unregister():\n    for c in reversed(classes):\n        bpy.utils.unregister_class(c)\n\nif __name__ == '__main__':\n    register()\n"),
+("Register a simple operator and panel that reports the active object name.",
+ "import bpy\n\nclass MY_OT_report(bpy.types.Operator):\n    bl_idname = 'my.report_active'\n    bl_label = 'Report Active'\n    def execute(self, context):\n        name = context.active_object.name if context.active_object else 'None'\n        self.report({'INFO'}, name)\n        return {'FINISHED'}\n\nclass MY_PT_panel(bpy.types.Panel):\n    bl_label = 'Info'\n    bl_idname = 'MY_PT_info'\n    bl_space_type = 'VIEW_3D'\n    bl_region_type = 'UI'\n    bl_category = 'Info'\n    def draw(self, context):\n        self.layout.operator('my.report_active')\n\nclasses = (MY_OT_report, MY_PT_panel)\n\ndef register():\n    for c in classes:\n        bpy.utils.register_class(c)\n\ndef unregister():\n    for c in reversed(classes):\n        bpy.utils.unregister_class(c)\n\nif __name__ == '__main__':\n    register()\n"),
+("Make an add-on panel with an operator that toggles viewport visibility of the active object.",
+ "import bpy\n\nclass MY_OT_toggle(bpy.types.Operator):\n    bl_idname = 'my.toggle_hide'\n    bl_label = 'Toggle Hide'\n    def execute(self, context):\n        obj = context.active_object\n        if obj:\n            obj.hide_viewport = not obj.hide_viewport\n        return {'FINISHED'}\n\nclass MY_PT_panel(bpy.types.Panel):\n    bl_label = 'Visibility'\n    bl_idname = 'MY_PT_visibility'\n    bl_space_type = 'VIEW_3D'\n    bl_region_type = 'UI'\n    bl_category = 'View'\n    def draw(self, context):\n        self.layout.operator('my.toggle_hide')\n\nclasses = (MY_OT_toggle, MY_PT_panel)\n\ndef register():\n    for c in classes:\n        bpy.utils.register_class(c)\n\ndef unregister():\n    for c in reversed(classes):\n        bpy.utils.unregister_class(c)\n\nif __name__ == '__main__':\n    register()\n"),
+("Provide a Blender add-on script defining an operator and a UI panel in the N-panel.",
+ "import bpy\n\nclass MY_OT_select_meshes(bpy.types.Operator):\n    bl_idname = 'my.select_meshes'\n    bl_label = 'Select Meshes'\n    def execute(self, context):\n        bpy.ops.object.select_all(action='DESELECT')\n        for obj in context.scene.objects:\n            if obj.type == 'MESH':\n                obj.select_set(True)\n        return {'FINISHED'}\n\nclass MY_PT_panel(bpy.types.Panel):\n    bl_label = 'Select'\n    bl_idname = 'MY_PT_select'\n    bl_space_type = 'VIEW_3D'\n    bl_region_type = 'UI'\n    bl_category = 'Select'\n    def draw(self, context):\n        self.layout.operator('my.select_meshes')\n\nclasses = (MY_OT_select_meshes, MY_PT_panel)\n\ndef register():\n    for c in classes:\n        bpy.utils.register_class(c)\n\ndef unregister():\n    for c in reversed(classes):\n        bpy.utils.unregister_class(c)\n\nif __name__ == '__main__':\n    register()\n"),
+],
+}
+
+
+B_OPENERS = [
+    "",
+    "You can do it like this:",
+    "Here's one way:",
+    "This script sets it up:",
+    "Example:",
+]
+
+
+def gen_area_b(n=20, rng_seed=200, seen_hashes=None, execute=True):
+    """Static topic-coverage pairs, verified the same way as LLM rows."""
+    rng = random.Random(rng_seed)
+    kept = []
+    stats = Counter()
+    pool = []
+    for topic, items in B_TOPICS.items():
+        for q, code in items:
+            pool.append((topic, q, code))
+    rng.shuffle(pool)
+    attempts = 0
+    for topic, question, code in pool:
+        if len(kept) >= n:
+            break
+        attempts += 1
+        opener = rng.choice(B_OPENERS)
+        answer = make_answer(opener, code)
+        ok, reason = validate_candidate(question, answer, "explanation",
+                                        seen_hashes, execute)
+        if not ok:
+            stats[f"verify_reject:{reason}"] += 1
+            continue
+        kept.append({
+            "question": question,
+            "answer": answer,
+            "type": "explanation",
+            "seed_id": None,
+            "source": "synthetic",
+            "producing_model": "programmatic:targeted",
+            "validated": True,
+            "verified": True,
+            "attempts": 0,
+            "topic_area": topic,
+            "timestamp": utc_now(),
+        })
+        stats[f"kept:{topic}"] += 1
+    stats["candidates"] = attempts
+    stats["kept_total"] = len(kept)
+    return kept, stats
+
+
+# -------------------- dedupe & overlap report --------------------
+def near_dedupe(rows, ratio=0.9, keep=2):
+    groups = []  # list of lists of indices
+    used = set()
+    for i, r in enumerate(rows):
+        if i in used:
+            continue
+        group = [i]
+        used.add(i)
+        for j in range(i + 1, len(rows)):
+            if j in used:
+                continue
+            q1, q2 = rows[i]["question"], rows[j]["question"]
+            if difflib.SequenceMatcher(None, q1, q2).ratio() >= ratio:
+                group.append(j)
+                used.add(j)
+        groups.append(group)
+    kept_idx = []
+    removed = 0
+    for g in groups:
+        kept_idx.extend(g[:keep])
+        removed += max(0, len(g) - keep)
+    kept_idx = sorted(kept_idx)
+    return [rows[i] for i in kept_idx], removed, sum(1 for g in groups if len(g) > 1)
+
+
+
+def decontam_rows(rows):
+    from pipeline.combine_data import drop_benchmark_overlaps
+    fd, path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+    try:
+        kept, dropped, _rules = drop_benchmark_overlaps(rows, path=path)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return kept, dropped
+
+
+def run_targeted(output_file, batch, seen_hashes, execute, remaining):
+    """Generate targeted rows and append them to the single output file."""
+    if batch <= 0 or remaining <= 0:
+        return 0
+    if not execute:
+        print("Skipping targeted rows: they need execution validation.")
+        return 0
+    print(f"Generating targeted rows (batch {batch} per area) ...", flush=True)
+    a_rows, a_stats = gen_area_a(batch, seen_hashes=seen_hashes, execute=execute)
+    b_rows, b_stats = gen_area_b(batch, seen_hashes=seen_hashes, execute=execute)
+    rows, removed, _groups = near_dedupe(a_rows + b_rows, ratio=0.9, keep=2)
+    if removed:
+        print(f"Near-duplicate dedupe: removed {removed}")
+    rows, dropped = decontam_rows(rows)
+    rows = rows[:remaining]
+    with open(output_file, "a", encoding="utf-8") as out_f:
+        for row in rows:
+            out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"Added {len(rows)} targeted rows "
+          f"(A={a_stats['kept_total']}, B={b_stats['kept_total']}, "
+          f"dropped {len(dropped)} benchmark overlaps).")
+    return len(rows)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 """Small-model -> verification -> sequential big-model correction pipeline.
 
 Per question, strictly in order:
@@ -42,7 +45,7 @@ OUTPUT = config.MODEL_CORRECTIONS_FILE
 _FILE_LOCK = threading.Lock()
 
 SMALL_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
-SMALL_MODEL = os.environ.get("SMALL_MODEL", "qwen3.5:4b")
+SMALL_MODEL = os.environ.get("SMALL_MODEL", "blender-copilot-v3.2")
 MAX_ATTEMPTS = 3
 
 SMALL_SYSTEM = (

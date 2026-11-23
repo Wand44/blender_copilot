@@ -8,9 +8,13 @@ import json
 import os
 import re
 import subprocess
+import sys
 import warnings
 from collections import Counter
 from typing import Optional
+
+# Allow `python3 core/validator.py` from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import code as code_mod
 from core import config

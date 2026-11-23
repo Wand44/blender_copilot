@@ -1,4 +1,10 @@
 """Single answer-verification path used by correction, verify, and tests."""
+import os
+import sys
+
+# Allow `python3 core/verify.py` from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from core import execution_validator, validator
 
 

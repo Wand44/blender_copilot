@@ -10,4 +10,7 @@ results/
 *.gguf
 export_metadata.json
 data/final.bak.*/
-new model/
+new_model/
+rerun_all.sh
+rerun_log.txt
+bench/results/

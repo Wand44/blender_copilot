@@ -26,8 +26,6 @@ BLENDER_BIN = os.environ.get("BLENDER_BIN", "blender")
 
 # Raw sources
 DOC_FILE = RAW / "doc_data.jsonl"
-ADDONS_FILE = RAW / "addons_data.jsonl"
-GENERAL_DATA_FILE = RAW / "general_data.jsonl"
 GENERAL_PYTHON_FILE = RAW / "general_python.jsonl"
 REPLAY_FILE = RAW / "replay_data.jsonl"
 DOC_DIR_DEFAULT = RAW / f"blender_python_reference_{TARGET_BLENDER.replace('.', '_')}"

@@ -3,10 +3,14 @@ import ast
 import json
 import math
 import re
+import sys
 import warnings
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Allow `python3 core/rows.py` from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import code as code_mod
 

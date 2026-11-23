@@ -32,8 +32,12 @@ def main():
 
     try:
         exec(payload["check"], ns)
-    except Exception as e:
+    except AssertionError as e:
         result["status"] = "wrong"
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+    except Exception as e:
+        result["status"] = "crashed"
         result["error"] = f"{type(e).__name__}: {e}"
         return result
 

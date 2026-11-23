@@ -1,0 +1,90 @@
+{
+  "addon_operator_panel": [
+    {
+      "index": 22,
+      "topic_area": "addon_operator_panel",
+      "question": "Provide a Blender add-on script defining an operator and a UI panel in the N-panel."
+    }
+  ],
+  "bmesh_wave_grid": [
+    {
+      "index": 31,
+      "topic_area": "bmesh",
+      "question": "Use bmesh to subdivide all edges of the active mesh in edit mode."
+    }
+  ],
+  "fix_legacy_28_api": [
+    {
+      "index": 2,
+      "topic_area": "error_fix/legacy_scene_link",
+      "question": "Running this in Blender gives `AttributeError: bpy_prop_collection: attribute \"link\" not found`. What's wrong and how sh"
+    },
+    {
+      "index": 5,
+      "topic_area": "error_fix/legacy_scene_link",
+      "question": "Can you fix this script?\n```python\nimport bpy\ncam_data = bpy.data.cameras.new(name=\"Cam\")\ncam = bpy.data.objects.new(\"Ca"
+    },
+    {
+      "index": 6,
+      "topic_area": "error_fix/legacy_scene_link",
+      "question": "This Blender script raises an error. How can I fix it?\n```python\nimport bpy\ncol = bpy.data.collections.get(\"Assets\")\nif "
+    },
+    {
+      "index": 16,
+      "topic_area": "error_fix/legacy_scene_active",
+      "question": "Can you fix this script?\n```python\nimport bpy\nbpy.ops.object.select_all(action='DESELECT')\nobj = bpy.data.objects.get(\"C"
+    },
+    {
+      "index": 17,
+      "topic_area": "error_fix/legacy_scene_link",
+      "question": "This Blender script raises an error. How can I fix it?\n```python\nimport bpy\nobj = bpy.context.active_object\nif obj:\n    "
+    }
+  ],
+  "fix_scale_assignment": [
+    {
+      "index": 4,
+      "topic_area": "error_fix/float_to_scale",
+      "question": "I get this traceback when I run my Blender code:\n```\nTraceback (most recent call last):\n  File \"/tmp/tmpyfznqg_a.py\", li"
+    }
+  ],
+  "keyframe_z": [
+    {
+      "index": 27,
+      "topic_area": "animation_fcurves",
+      "question": "Insert a scale keyframe at frame 1 and frame 24 for the active object."
+    }
+  ],
+  "mesh_from_pydata": [
+    {
+      "index": 36,
+      "topic_area": "from_pydata",
+      "question": "Build a triangle mesh using from_pydata and link it."
+    }
+  ],
+  "render_settings": [
+    {
+      "index": 28,
+      "topic_area": "camera_render_output",
+      "question": "Set the active camera and configure render resolution and output path."
+    }
+  ],
+  "sphere_at_position": [
+    {
+      "index": 3,
+      "topic_area": "error_fix/wrong_op_cube",
+      "question": "I get this traceback when I run my Blender code:\n```\nTraceback (most recent call last):\n  File \"/tmp/tmpladdgq8r.py\", li"
+    },
+    {
+      "index": 35,
+      "topic_area": "collections_parenting",
+      "question": "Parent one object to another and keep its world transform."
+    }
+  ],
+  "subsurf_smooth": [
+    {
+      "index": 37,
+      "topic_area": "modifiers_shade",
+      "question": "Add a Subdivision Surface modifier to the active mesh and smooth-shade it."
+    }
+  ]
+}

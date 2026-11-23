@@ -2,10 +2,15 @@
 import json
 import os
 import re
+import sys
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from bs4 import BeautifulSoup
+
+# Allow `python3 pipeline/extract_docs.py` from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from core import config
 
 DOC_DIR = str(config.DOC_DIR_DEFAULT)

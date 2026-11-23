@@ -15,8 +15,12 @@ import ast
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from typing import Dict, List, Tuple
+
+# Allow `python3 core/execution_validator.py` from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import config
 

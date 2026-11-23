@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Re-run verification over generated rows using the shared core verifier."""
 import argparse
+import sys
+from pathlib import Path
+
+# Allow `python3 pipeline/verify.py` from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import config, execution_validator, validator
 from core.gpu import warn_if_busy

@@ -1,4 +1,10 @@
 """Duplicate detection shared by combine_data and tests."""
+import os
+import sys
+
+# Allow `python3 core/dedupe.py` from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from core import code as code_mod
 
 

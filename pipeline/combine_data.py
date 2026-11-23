@@ -34,9 +34,6 @@ SOURCE_MAP = {
     "doc_data": "docs",
     "synthetic": "synthetic",
     "model_corrections": "correction",
-    "addons": "addon",
-    "general_usage": "general",
-    "general_data": "general",
     "general_python": "general",
     "replay": "replay",
 }
@@ -56,14 +53,6 @@ CONFIG = {
             "paths": [{"source": "general_python",
                        "path": str(config.GENERAL_PYTHON_FILE), "fill": True}],
             "ratio": 0.10,
-        },
-        "addons": {
-            "paths": [{"source": "addons", "path": str(config.ADDONS_FILE)}],
-            "ratio": None,
-        },
-        "general_usage": {
-            "paths": [{"source": "general_data", "path": str(config.GENERAL_DATA_FILE)}],
-            "ratio": None,
         },
         "replay": {
             "paths": [{"source": "replay", "path": str(config.REPLAY_FILE)}],

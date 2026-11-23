@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark a local Ollama model on bench/cases.py.
+"""Benchmark a model on bench/cases.py via Ollama or an OpenAI-compatible server.
 
-    python3 bench/run_bench.py --validate             # sanity-check every reference
-    python3 bench/run_bench.py --samples 5            # benchmark qwen3.5:4b
+    python3 pipeline/benchmark.py --validate
+    python3 pipeline/benchmark.py --samples 5
+    python3 pipeline/benchmark.py --backend openai --model blender-copilot-v3
 
 Each sample runs in a fresh headless Blender, so one bad script cannot affect
 the next one.
@@ -36,27 +37,32 @@ BLENDER = os.environ.get("BLENDER_BIN", "blender")
 RUNNER = BENCH_DIR / "blender_runner.py"
 RESULTS = ROOT / "bench" / "results"
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
-MODEL = "qwen3.5:4b"
+OPENAI = "http://localhost:8080/v1/chat/completions"
 RUN_TIMEOUT = 60
 FENCE = re.compile(r"```python[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
 def extract_code(response):
     match = FENCE.search(response)
-    return match.group(1) if match else response
+    if match:
+        return match.group(1)
+    open_match = re.search(r"```python[ \t]*\r?\n", response, re.IGNORECASE)
+    if open_match:
+        return response[open_match.end():]
+    return response
 
 
-def ask_ollama(prompt, temperature, model=None, think=False):
+def ask_ollama(prompt, temperature, model, max_tokens, think=False):
     try:
         resp = requests.post(
             OLLAMA,
             json={
-                "model": model or MODEL,
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
                 # thinking mode can burn thousands of tokens and return no code
                 "think": bool(think),
-                "options": {"temperature": temperature},
+                "options": {"temperature": temperature, "num_predict": max_tokens},
             },
             timeout=600,
         )
@@ -64,6 +70,26 @@ def ask_ollama(prompt, temperature, model=None, think=False):
         raise SystemExit(f"ollama request failed ({OLLAMA}): {e}")
     resp.raise_for_status()
     return resp.json()["message"]["content"]
+
+
+def ask_openai(prompt, temperature, model, max_tokens, url=None):
+    url = url or OPENAI
+    try:
+        resp = requests.post(
+            url,
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": False,
+            },
+            timeout=600,
+        )
+    except requests.RequestException as e:
+        raise SystemExit(f"openai request failed ({url}): {e}")
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
 
 
 def run_blender(setup, code, check):
@@ -127,15 +153,36 @@ def validate(jobs):
     return 0
 
 
-def benchmark(samples_per_case, temperature, jobs, model=None, think=False):
-    model = model or MODEL
+def benchmark(samples_per_case, temperature, jobs, model, think=False,
+              backend="ollama", url=None, max_tokens=2048):
     samples = []
     total = len(CASES) * samples_per_case
     done = 0
+    endpoint = url or (OPENAI if backend == "openai" else OLLAMA)
+    server_model_path = None
+    if backend == "openai":
+        server_settings = {}
+        try:
+            base = endpoint.split("/v1/")[0]
+            props = requests.get(base + "/props", timeout=10)
+            props.raise_for_status()
+            props_json = props.json()
+            server_settings = props_json.get("default_generation_settings", {})
+            server_model_path = props_json.get("model_path")
+        except Exception:
+            pass
+        if server_model_path:
+            print(f"server model_path: {server_model_path}", flush=True)
+    else:
+        server_settings = {"options": {"temperature": temperature, "num_predict": max_tokens}}
+
     for case in CASES:
         print(f"querying {case['id']} x{samples_per_case} ...", flush=True)
         for _ in range(samples_per_case):
-            response = ask_ollama(case["prompt"], temperature, model=model, think=think)
+            if backend == "openai":
+                response = ask_openai(case["prompt"], temperature, model, max_tokens, url=url)
+            else:
+                response = ask_ollama(case["prompt"], temperature, model, max_tokens, think=think)
             samples.append({
                 "id": case["id"],
                 "tier": case["tier"],
@@ -161,7 +208,9 @@ def benchmark(samples_per_case, temperature, jobs, model=None, think=False):
              case=sample["id"], status=status)
 
     summary = summarize(samples, samples_per_case)
-    path = save(samples, summary, samples_per_case, temperature, model=model, think=think)
+    path = save(samples, summary, samples_per_case, temperature, model=model, think=think,
+                backend=backend, url=url, max_tokens=max_tokens,
+                server_settings=server_settings, server_model_path=server_model_path)
     print_summary(summary)
     print(f"\nwrote {path}")
     return 0
@@ -190,17 +239,24 @@ def summarize(samples, samples_per_case):
     }
 
 
-def save(samples, summary, samples_per_case, temperature, model=None, think=False):
-    model = model or MODEL
+def save(samples, summary, samples_per_case, temperature, model, think=False,
+         backend="ollama", url=None, max_tokens=2048, server_settings=None,
+         server_model_path=None):
+    url = url or (OPENAI if backend == "openai" else OLLAMA)
     RESULTS.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = RESULTS / f"{stamp}_{model.replace(':', '-').replace('/', '-')}.json"
     path.write_text(json.dumps({
         "model": model,
         "timestamp": stamp,
+        "backend": backend,
+        "url": url,
         "think": bool(think),
         "samples_per_case": samples_per_case,
         "temperature": temperature,
+        "max_tokens": max_tokens,
+        "server_settings": server_settings or {},
+        "server_model_path": server_model_path,
         "summary": summary,
         "samples": samples,
     }, indent=2))
@@ -232,8 +288,14 @@ def main():
                         help="run every case's reference instead of the model")
     parser.add_argument("--jobs", type=int, default=4,
                         help="parallel Blender processes (default 4)")
-    parser.add_argument("--model", default=MODEL,
-                        help=f"Ollama model name (default {MODEL})")
+    parser.add_argument("--model", default=None,
+                        help="model name (required unless --validate)")
+    parser.add_argument("--max-tokens", type=int, default=2048,
+                        help="max tokens to generate (default 2048)")
+    parser.add_argument("--backend", choices=("ollama", "openai"), default="ollama",
+                        help="API backend (default ollama)")
+    parser.add_argument("--url", default=None,
+                        help="override the backend endpoint URL")
     parser.add_argument("--think", dest="think", action="store_true",
                         help="enable Ollama thinking mode")
     parser.add_argument("--no-think", dest="think", action="store_false",
@@ -245,9 +307,13 @@ def main():
         parser.error("--samples must be at least 1")
     if args.validate:
         return validate(args.jobs)
+    if not args.model:
+        parser.error("--model is required")
     warn_if_busy()
     return benchmark(args.samples, args.temperature, args.jobs,
-                     model=args.model, think=args.think)
+                     model=args.model, think=args.think,
+                     backend=args.backend, url=args.url,
+                     max_tokens=args.max_tokens)
 
 
 if __name__ == "__main__":
