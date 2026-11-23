@@ -13,6 +13,9 @@ from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
 
+# Allow `python3 pipeline/combine_data.py` from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from core import config, validator
 from core import code as code_mod
 from core import dedupe as dedupe_mod
@@ -59,7 +62,7 @@ CONFIG = {
             "ratio": None,
         },
     },
-    "target_total": 1000,
+    "target_total": 2000,
     "output": str(config.TRAIN_FILE),
     "val": str(config.VAL_FILE),
     "preferences": str(config.PREFERENCE_FILE),
@@ -376,7 +379,7 @@ def build_manifest(train_rows, val_rows, preferred_rows, dedupe_stats,
         "api_areas": dict(api_area_counts.most_common()),
         "api_categories": {name: category_counts.get(name, 0)
                            for name in rows_mod.API_AREA_GROUPS},
-        "files": {name: path for name, path in (
+        "files": {name: str(Path(path).relative_to(config.ROOT)) for name, path in (
             ("train", CONFIG["output"]), ("val", CONFIG["val"]),
             ("preferred", CONFIG["preferences"]),
             ("manifest", CONFIG["manifest"]),

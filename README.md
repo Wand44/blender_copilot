@@ -1,6 +1,10 @@
 # Blender Copilot
 
-Fine-tuning data generator for a Blender 5.1.1 Python coding assistant (QLoRA on a Qwen coder model).
+[![Model on Hugging Face](https://img.shields.io/badge/Hugging%20Face-blender_copilot_v1-FFD21E?logo=huggingface&logoColor=black)](https://huggingface.co/BlenderFace34/blender_copilot_v1)
+![Blender 5.1.1](https://img.shields.io/badge/Blender-5.1.1-E87D0D?logo=blender&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+
+Fine-tuning data generator for a Blender 5.1.1 Python coding assistant (QLoRA on a Qwen coder model). Model: [BlenderFace34/blender_copilot_v1](https://huggingface.co/BlenderFace34/blender_copilot_v1).
 
 ## Model stats 
 
