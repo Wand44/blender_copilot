@@ -4,9 +4,10 @@
 ![Blender 5.1.1](https://img.shields.io/badge/Blender-5.1.1-E87D0D?logo=blender&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
 
-Fine-tuning data generator for a Blender 5.1.1 Python coding assistant (QLoRA on a Qwen coder model). Model: [BlenderFace34/blender_copilot_v1](https://huggingface.co/BlenderFace34/blender_copilot_v1).
+Fine-tuning data generator for a Blender 5.1.1 Python coding assistant (QLoRA on a Qwen3.5-4B). Model: [BlenderFace34/blender_copilot_v1](https://huggingface.co/BlenderFace34/blender_copilot_v1).
 
-## Model stats 
+## Model stats
+> Each model was asked 18 Blender tasks, 5 samples per task (90 samples total). Every generated script runs in a fresh headless Blender and is checked against a task-specific assertion.
 
 | Model | pass@1 | pass@5 | Passed | Crashed | Easy | Medium | Hard | Fix |
 |-------|-------:|-------:|-------:|--------:|-----:|-------:|-----:|----:|
@@ -20,7 +21,28 @@ blender-copilot-v1 | █████████████ 26.7%
 qwen3.5-9b         | █████████████████ 35.6%
 ```
 
-The blender-copilot-v1 triples pass@1 over its base (8.9% → 26.7%) and raises pass@5 to 44.4% comiing closer to the 9B base.
+Blender-copilot-v1 triples pass@1 over its base (8.9% → 26.7%) and raises pass@5 to 44.4% coming closer to the 9B base.
+
+## Training
+ 
+Training code is not part of this repo; the settings are recorded here for reference.
+ 
+- **Base model:** `unsloth/Qwen3.5-4B`
+- **Method:** QLoRA, 3 epochs scheduled (405 steps), peak LR 2e-4 with linear decay
+- **Data:** about 1,080 training and 38 validation examples (built with this pipeline)
+- **Checkpoint:** the exported model is the checkpoint near step 130, where validation loss was lowest (about 0.54). Validation loss rose afterwards while training loss kept falling (overfitting).
+- **Export:** merged and converted to GGUF (`Q4_K_M`)
+## Using the model
+ 
+The GGUF loads in current [llama.cpp](https://github.com/ggml-org/llama.cpp). It currently **fails to load in Ollama** (`tensor 'blk.0.ssm_beta.weight' not found`), because the exported file stores the SSM tensors in a fused layout that Ollama's bundled loader does not expect yet.
+ 
+```bash
+llama-server -m Qwen3.5-4B.Q4_K_M.gguf -ngl 99 -c 4096 --port 8080 \
+  --chat-template-kwargs '{"enable_thinking":false}'
+```
+ 
+This serves a chat UI and an OpenAI-compatible API at `http://localhost:8080`. Run the model with thinking disabled; with thinking enabled, the answer may end up in `reasoning_content` instead of `content`.
+ 
 
 ## Repo layout
 
@@ -74,10 +96,9 @@ All paths and the target Blender version live in `core/config.py`.
    - Writes `data/final/train.jsonl`, `val.jsonl`, `preference_pairs.jsonl`, and
      `manifest.json` (per-source counts, verified %, duplicates, length stats,
      API-area/category coverage).
-   - Groups: `blender_core` (70%), `general_python` (10%), addons, general usage,
-     replay (when the file exists).
+   - Groups: `blender_core` (70%), `general_python` (10%), replay (when the file exists).
 
-7. **Benchmark** - `python3 -m pipeline.benchmark --model qwen3.5:9b --samples 5 --temperature 0.2 --no-think`
+7. **Benchmark** - `python3 -m pipeline.benchmark --model qwen3.5:9b --samples 5 --temperature 0.3 --no-think`
    - Results go to `bench/results/` with `model`, `think`, `samples_per_case`,
      `temperature`, summary, and per-sample outcomes.
 
@@ -86,8 +107,6 @@ All paths and the target Blender version live in `core/config.py`.
 | File | Contents | Origin |
 |------|----------|--------|
 | `data/raw/doc_data.jsonl` | Blender 5.1.1 Python API reference, converted to Q&A | Sphinx HTML from the Blender docs |
-| `data/raw/addons_data.jsonl` | Real Blender addon code | [Blender addons](https://huggingface.co/datasets/stodipro/blenderaddon) |
-| `data/raw/general_data.jsonl` | General Blender usage Q&A | [General Blender Info](https://huggingface.co/datasets/Fikrat/blender) |
 | `data/raw/general_python.jsonl` | General Python coding instructions (keeps basic Python alive) | [CodeAlpaca (general code)](https://huggingface.co/datasets/sahil2801/CodeAlpaca-20k) |
 | `data/raw/replay_data.jsonl` | Optional replay rows (schema as usual, source `replay`) | your own file |
 | `data/generated/synthetic_training_data.jsonl` | Generated samples, statically and headlessly validated | `pipeline/generate_synthetic.py` |
@@ -127,7 +146,7 @@ export OMNIRoute_MODEL=auto/best-coding
 python3 -m pipeline.generate_synthetic --limit 200
 python3 -m pipeline.model_correction --questions 20
 python3 -m pipeline.combine_data
-python3 -m pipeline.benchmark --model qwen3.5:9b --samples 5 --temperature 0.2
+python3 pipeline/benchmark.py --backend openai --model <label> --samples 5 --temperature 0.3
 
 # Smoke tests (execution checks require Blender)
 python3 tests/test_validator.py
@@ -148,5 +167,7 @@ python3 tests/test_validator.py
 - Execution validation is slow (one fresh Blender process per sample). Use `--limit` and parallelism carefully.
 - Refactor behavioral equivalence is narrow; broaden templates as needed.
 - The API cache is built against the installed Blender (5.1.1).
-- There is no training or export code in this repo.
-- Blender API covarage is spoty. 
+- There is no training or export scripts in this repo.
+- Blender API coverage is spotty.
+- The model is not reliable for medium or hard tasks. Always review generated code before running it in a scene you care about.
+- Thinking mode: run with thinking disabled (`enable_thinking: false`); with it on, the answer may land in `reasoning_content` and `content` can come back empty. All benchmarks used thinking off.
